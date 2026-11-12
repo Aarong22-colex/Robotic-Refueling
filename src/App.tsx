@@ -5,313 +5,350 @@ import { Toaster } from '@/components/ui/toaster';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import NotFound from '@/pages/not-found';
 import { Route, Switch, useLocation, Router as WouterRouter } from 'wouter';
-import { Aperture, Check, CheckCircle2, CircleDot, Crosshair, Gauge, Hand, RotateCcw, Scissors, ShieldCheck, Unplug, Wrench } from 'lucide-react';
+import { Aperture, Check, CheckCircle2, CircleDot, Crosshair, Gauge, Hand, RotateCcw, Scissors, ShieldCheck, Unplug, Wrench, ZoomIn, ZoomOut } from 'lucide-react';
+import { advanceTransfer, attemptMissionOperation, createInitialMissionState, getGripWindow, getRequiredTool, getToolName, isToolAvailable, MISSION_STEPS, SIMULATED_TRANSFER_RATE_LPS, TANK_CAPACITY_LITERS, type CameraMode, type ToolId } from './simulator/mission';
+import { ARM_GEOMETRY, forwardKinematics, measureAlignment, solveInverseKinematics, targetForStage, type JointAngles } from './simulator/kinematics';
 
-type Tool = 'camera' | 'wire-cutter' | 'cap-tool' | 'hose';
 type Entry = { time: string; message: string; warn?: boolean };
 const queryClient = new QueryClient();
-const tools: { id: Tool; name: string; icon: typeof Aperture }[] = [
-  { id: 'camera', name: 'Inspection camera', icon: Aperture },
-  { id: 'wire-cutter', name: 'Wire cutter', icon: Scissors },
-  { id: 'cap-tool', name: 'Cap removal tool', icon: Wrench },
-  { id: 'hose', name: 'Refueling hose', icon: Unplug },
+const tools: { id: ToolId; icon: typeof Aperture }[] = [
+  { id: 'wire-blanket', icon: Scissors },
+  { id: 'cap-removal', icon: Wrench },
+  { id: 'multifunction', icon: Hand },
+  { id: 'nozzle', icon: Unplug },
 ];
-const stages = ['Inspect module', 'Cut safety wires', 'Remove fuel caps', 'Align hose', 'Transfer ethanol', 'Disconnect & verify'];
-const phaseTitle = ['Module inspection', 'Safety wire removal', 'Protective cap removal', 'Hose alignment & capture', 'Fuel transfer', 'Fuel transfer', 'Valve closure', 'Hose disconnect', 'Transfer verification', 'Mission complete'];
-const valveTarget = { x: 792, y: 154 };
-const formatElapsed = (seconds: number) => `00:${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
+const toolTestIds: Record<ToolId, string> = {
+  'wire-blanket': 'button-tool-wire-blanket',
+  'cap-removal': 'button-tool-cap-removal',
+  multifunction: 'button-tool-multifunction',
+  nozzle: 'button-tool-nozzle',
+};
+const cameraModes: { id: CameraMode; label: string; testId: string }[] = [
+  { id: 'overview', label: 'Overview', testId: 'button-camera-overview' },
+  { id: 'wrist', label: 'Wrist camera', testId: 'button-camera-wrist' },
+  { id: 'worksite', label: 'Worksite close-up', testId: 'button-camera-worksite' },
+];
+const formatElapsed = (seconds: number) => `${String(Math.floor(seconds / 3600)).padStart(2, '0')}:${String(Math.floor((seconds % 3600) / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
+const initialAngles = () => solveInverseKinematics(targetForStage('inspection'));
 
 function App() {
-  const [phase, setPhase] = useState(0);
+  const [mission, setMission] = useState(createInitialMissionState);
+  const [selectedTool, setSelectedTool] = useState<ToolId>('wire-blanket');
+  const [cameraMode, setCameraMode] = useState<CameraMode>('overview');
+  const [angles, setAngles] = useState<JointAngles>(initialAngles);
+  const [gripForce, setGripForce] = useState(50);
+  const [zoom, setZoom] = useState(1);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
-  const [selectedTool, setSelectedTool] = useState<Tool>('camera');
-  const [wireCut, setWireCut] = useState(false);
-  const [capsRemoved, setCapsRemoved] = useState(false);
-  const [secured, setSecured] = useState(false);
-  const [valveOpen, setValveOpen] = useState(false);
-  const [hoseDisconnected, setHoseDisconnected] = useState(false);
-  const [verified, setVerified] = useState(false);
-  const [transfer, setTransfer] = useState(0);
-  const [transferActive, setTransferActive] = useState(false);
-  const [cameraView, setCameraView] = useState(false);
-  const [position, setPosition] = useState(valveTarget);
   const [warning, setWarning] = useState('');
-  const [log, setLog] = useState<Entry[]>([{ time: '00:00:00', message: 'Simulation initialized. Dextre end effector is parked.' }]);
+  const [log, setLog] = useState<Entry[]>([{ time: '00:00:00', message: 'Simulation initialized. Manipulator parked at survey pose.' }]);
+  const target = useMemo(() => targetForStage(mission.stage), [mission.stage]);
+  const pose = useMemo(() => forwardKinematics(angles), [angles]);
+  const alignment = useMemo(() => measureAlignment(pose.endEffector, target), [pose.endEffector, target]);
+  const requiredTool = getRequiredTool(mission.stage);
+  const liters = TANK_CAPACITY_LITERS * mission.transferPercent / 100;
+  const cameraLabel = cameraModes.find((mode) => mode.id === cameraMode)?.label ?? 'Overview';
+  const stageIndex = MISSION_STEPS.findIndex((step) => step.id === mission.stage);
+  const currentStageLabel = mission.stage === 'complete' ? 'Mission complete' : MISSION_STEPS[stageIndex]?.label ?? 'Mission operation';
+  const gripWindow = getGripWindow(mission.stage);
+
+  const addLog = (message: string, warn = false) => {
+    const stamp = formatElapsed(elapsedSeconds);
+    setLog((items) => [{ time: stamp, message, warn }, ...items].slice(0, 40));
+  };
+  const raiseWarning = (message: string) => {
+    setWarning(message);
+    addLog(message, true);
+  };
 
   useEffect(() => {
     const timer = window.setInterval(() => setElapsedSeconds((seconds) => seconds + 1), 1000);
     return () => window.clearInterval(timer);
   }, []);
 
-  const alignment = useMemo(() => {
-    const dx = position.x - valveTarget.x;
-    const dy = position.y - valveTarget.y;
-    return Math.max(0, Math.min(100, Math.round(100 - Math.sqrt(dx * dx + dy * dy) / 2.7)));
-  }, [position]);
-  const aligned = alignment >= 90;
-  const completedCount = phase >= 8 ? 6 : phase >= 6 ? 5 : phase >= 4 ? 4 : phase;
-  const stageIndex = phase <= 2 ? phase : phase === 3 ? 3 : phase <= 5 ? 4 : 5;
-
-  const addLog = (message: string, warn = false) => {
-    const stamp = formatElapsed(elapsedSeconds);
-    setLog((items) => [{ time: stamp, message, warn }, ...items].slice(0, 24));
-  };
-  const raiseWarning = (message: string) => {
-    setWarning(message);
-    addLog(message, true);
-  };
-  const selectTool = (tool: Tool) => {
-    setSelectedTool(tool);
-    setWarning('');
-    addLog(`${tools.find((item) => item.id === tool)?.name} selected.`);
-  };
-  const requireTool = (needed: Tool, description: string) => {
-    if (selectedTool !== needed) {
-      raiseWarning(`Wrong tool: ${description} requires the ${tools.find((item) => item.id === needed)?.name.toLowerCase()}. Select it before proceeding.`);
-      return false;
-    }
-    return true;
-  };
-  const performAction = () => {
-    setWarning('');
-    if (phase === 0) {
-      if (!requireTool('camera', 'Module inspection')) return;
-      setCameraView(true);
-      setPhase(1);
-      addLog('Module inspected by camera. Retaining wires and protective caps identified.');
-    } else if (phase === 1) {
-      if (!requireTool('wire-cutter', 'Safety wire removal')) return;
-      setWireCut(true);
-      setPhase(2);
-      addLog('Two retaining safety wires cut and cleared from the service panel.');
-    } else if (phase === 2) {
-      if (!requireTool('cap-tool', 'Cap removal')) return;
-      setCapsRemoved(true);
-      setPhase(3);
-      addLog('Protective fuel caps removed. Valve interface is exposed.');
-    } else if (phase === 3) {
-      if (!requireTool('hose', 'Hose capture')) return;
-      if (!aligned) {
-        raiseWarning(`Hose alignment is ${alignment}%. Reposition the end effector until alignment reaches 90% or higher.`);
-        return;
-      }
-      setSecured(true);
-      setPhase(4);
-      addLog('Hose seated and secured to the fuel valve. Seal check passed.');
-    } else if (phase === 4) {
-      if (!secured) { raiseWarning('Hose is not secured. Complete hose alignment and capture first.'); return; }
-      setValveOpen(true);
-      setPhase(5);
-      setTransferActive(true);
-      addLog('Fuel valve opened. Simulated ethanol transfer initiated.');
-    } else if (phase === 5) {
-      raiseWarning('Transfer is in progress. Close the valve only after the receiving tank reaches 100%.');
-    } else if (phase === 6) {
-      if (!requireTool('hose', 'Hose disconnect')) return;
-      if (valveOpen) { raiseWarning('Valve is still open. Close it before disconnecting the hose.'); return; }
-      setHoseDisconnected(true);
-      setPhase(7);
-      addLog('Refueling hose disconnected and stowed clear of the valve.');
-    } else if (phase === 7) {
-      if (selectedTool !== 'camera') { raiseWarning('Verification requires the inspection camera. Select the camera to confirm the valve and transfer indicators.'); return; }
-      setVerified(true);
-      setPhase(8);
-      addLog(`Transfer verified: ${transfer}% of illustrative tank capacity received. Mission sequence complete.`);
-    }
-  };
+  useEffect(() => {
+    if (!mission.transferActive) return;
+    const timer = window.setInterval(() => setMission((current) => advanceTransfer(current, 2)), 200);
+    return () => window.clearInterval(timer);
+  }, [mission.transferActive]);
 
   useEffect(() => {
-    if (!transferActive) return;
-    const timer = window.setInterval(() => {
-      setTransfer((value) => {
-        const next = Math.min(100, value + 2);
-        if (next >= 100) {
-          window.clearInterval(timer);
-          setTransferActive(false);
-          setPhase((current) => current === 5 ? 6 : current);
-          addLog('Transfer target reached. Close valve to continue.');
-        }
-        return next;
-      });
-    }, 120);
-    return () => window.clearInterval(timer);
-  }, [transferActive]);
+    if (mission.stage === 'valve-closure' && mission.transferPercent >= 100) {
+      setWarning('');
+      addLog('Transfer target reached. Receiving tank is at capacity; close the valve to continue.');
+    }
+  // Stage transition occurs once when advanceTransfer reaches 100%.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mission.stage]);
 
-  const closeValve = () => {
-    if (phase !== 6 || transfer < 100) {
-      raiseWarning('Transfer is not complete. Allow the receiving tank to reach 100% before valve closure.');
+  const selectTool = (tool: ToolId) => {
+    setSelectedTool(tool);
+    setWarning('');
+    addLog(`${getToolName(tool)} mounted at the end effector.`);
+  };
+  const operate = () => {
+    setWarning('');
+    const result = attemptMissionOperation(mission, { tool: selectedTool, cameraMode, alignment, gripForce });
+    if (result.warning) {
+      setWarning(result.warning);
+      addLog(result.warning, true);
       return;
     }
-    setValveOpen(false);
-    addLog('Fuel valve closed. Pressure equalization confirmed.');
+    setMission(result.state);
+    if (result.event) addLog(result.event);
+  };
+  const setCamera = (mode: CameraMode) => {
+    setCameraMode(mode);
+    setWarning('');
+    addLog(`${cameraModes.find((item) => item.id === mode)?.label} selected.`);
+  };
+  const updateGrip = (value: number) => {
+    setGripForce(value);
+    if (gripWindow && (value < gripWindow[0] || value > gripWindow[1])) {
+      setWarning(`Grip ${value}% is outside the current safe window (${gripWindow[0]}–${gripWindow[1]}%). Adjust before contact.`);
+    } else setWarning('');
+  };
+  const reposition = () => {
+    setAngles(solveInverseKinematics(target));
+    setWarning('');
+    addLog('Manipulator moved to the current stage target using inverse kinematics.');
   };
   const reset = () => {
-    setPhase(0); setSelectedTool('camera'); setWireCut(false); setCapsRemoved(false); setSecured(false);
-    setValveOpen(false); setHoseDisconnected(false); setVerified(false); setTransfer(0); setTransferActive(false);
+    setMission(createInitialMissionState());
+    setSelectedTool('wire-blanket');
+    setCameraMode('overview');
+    setAngles(initialAngles());
+    setGripForce(50);
+    setZoom(1);
     setElapsedSeconds(0);
-    setCameraView(false); setPosition(valveTarget); setWarning('');
-    setLog([{ time: '00:00:00', message: 'Simulation reset. Dextre end effector is parked.' }]);
+    setWarning('');
+    setLog([{ time: '00:00:00', message: 'Simulation reset. Manipulator returned to survey pose.' }]);
   };
-  const actionLabel = phase === 0 ? 'Inspect module' : phase === 1 ? 'Cut retaining wires' : phase === 2 ? 'Remove fuel caps' : phase === 3 ? 'Secure hose' : phase === 4 ? 'Open fuel valve' : phase === 5 ? 'Transfer in progress' : phase === 6 ? 'Disconnect hose' : phase === 7 ? 'Verify transfer' : 'Mission complete';
+  const actionLabel = mission.stage === 'inspection' ? 'Inspect module' :
+    mission.stage === 'wire-clearance' ? 'Cut wires & clear blanket' :
+    mission.stage === 'cap-removal' ? 'Remove protective cap' :
+    mission.stage === 'valve-access' ? 'Open valve guard' :
+    mission.stage === 'nozzle-connection' ? 'Connect nozzle' :
+    mission.stage === 'transfer' ? 'Open fuel valve' :
+    mission.stage === 'valve-closure' ? 'Close fuel valve' :
+    mission.stage === 'disconnect' ? 'Disconnect nozzle' :
+    mission.stage === 'verification' ? 'Verify & complete report' : 'Mission complete';
+
+  const viewCenter = cameraMode === 'overview' ? { x: 500, y: 325 } : cameraMode === 'wrist' ? pose.endEffector : target;
+  const viewWidth = 1000 / zoom;
+  const viewHeight = 650 / zoom;
+  const viewBox = `${viewCenter.x - viewWidth / 2} ${viewCenter.y - viewHeight / 2} ${viewWidth} ${viewHeight}`;
+  const targetReady = alignment.withinTolerance;
 
   return (
     <main className="app-shell">
       <header className="topbar">
         <div className="brand">
-          <div className="brand-mark" aria-hidden="true"><CircleDot size={19} /></div>
+          <div className="brand-mark" aria-hidden="true"><CircleDot size={17} /></div>
           <div><div className="brand-title">RRM / SERVICING SIMULATOR</div><div className="brand-sub">ROBOTIC REFUELING MISSION · LEARNING ENVIRONMENT</div></div>
         </div>
-        <div className="top-meta"><span className="hide-mobile"><i className="live-dot" />SIMULATION ACTIVE</span><span className="disclaimer">ILLUSTRATIVE RECREATION — NOT NASA SOFTWARE</span></div>
+        <div className="top-meta"><span className="hide-mobile"><i className="live-dot" />SIMULATION ACTIVE</span><span className="disclaimer">NOT NASA SOFTWARE · NOT FLIGHT TELEMETRY</span></div>
       </header>
       <div className="main">
         <div className="heading-row">
-          <div><div className="eyebrow">MISSION 01 · ON-ORBIT SERVICING</div><h1>Refueling sequence</h1></div>
+          <div><div className="eyebrow">MISSION 01 · ON-ORBIT SERVICING TRAINING</div><h1>Refueling sequence</h1></div>
           <div className="mission-number">MISSION ELAPSED<strong data-testid="text-elapsed">{formatElapsed(elapsedSeconds)}</strong></div>
         </div>
-        {phase >= 8 && <div className="complete-banner" data-testid="status-mission-success">
-          <div><strong>Servicing sequence complete</strong><span>Transfer verified · {transfer}% illustrative tank capacity · Ethanol analog</span>
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '5px 15px', marginTop: 9, fontSize: 9 }}>
-              {['Module inspected', 'Safety wires cut', 'Fuel caps removed', 'Hose secured', 'Valve cycled & transfer complete', 'Hose disconnected', 'Transfer verified'].map((item) => <span key={item}><Check size={11} style={{ verticalAlign: 'middle', marginRight: 4 }} />{item}</span>)}
+
+        {mission.stage === 'complete' && <section className="complete-banner" data-testid="status-success">
+          <div><strong>Servicing sequence complete</strong><span>Transfer verified · {liters.toFixed(2)} L simulated · illustrative ethanol analog</span>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '5px 14px', marginTop: 8, fontSize: 9 }}>
+              {['Module inspected', 'Wires cut & blanket cleared', 'Cap removed', 'Valve accessed', 'Nozzle connected', 'Transfer complete', 'Valve closed', 'Nozzle disconnected', 'Visual verification'].map((item) => <span key={item}><Check size={10} style={{ verticalAlign: 'middle', marginRight: 4 }} />{item}</span>)}
             </div>
-          </div>
-          <CheckCircle2 size={22} />
-        </div>}
-        <nav className="step-strip" aria-label="Mission operations">
-          {stages.map((name, index) => {
-            const done = index < completedCount;
-            return <div className={`step ${done ? 'done' : ''} ${index === stageIndex && phase < 8 ? 'current' : ''}`} key={name} data-testid={`stage-${index}`}>
-              <small>{done ? 'COMPLETE' : `0${index + 1} / OP`}</small><span>{name}</span>
+          </div><CheckCircle2 size={21} />
+        </section>}
+
+        <nav className="step-strip" aria-label="Mission operation sequence">
+          {MISSION_STEPS.map((step, index) => {
+            const done = mission.stage === 'complete' || index < stageIndex;
+            return <div className={`step ${done ? 'done' : ''} ${index === stageIndex && mission.stage !== 'complete' ? 'current' : ''}`} key={step.id} data-testid={`stage-${step.id}`}>
+              <small>{done ? 'COMPLETE' : `0${index + 1} / OP`}</small><span>{step.label}</span>
             </div>;
           })}
         </nav>
+
         <div className="workspace">
-          <section className="panel worksite" aria-label="Robotic servicing worksite">
-            <div className="panel-head"><span>Servicing worksite / external view</span><span className="head-right"><span className="status-dot" />Dextre · arm 2</span></div>
+          <section className="panel worksite" aria-label="Orbital robotic servicing worksite">
+            <div className="panel-head"><span>External worksite / {cameraLabel}</span><span className="head-right"><span className="status-dot" />DEXTRE · ARM 2</span></div>
             <div className="scene" data-testid="visual-worksite">
-              <div className="scene-label scene-tag" style={{ left: 14, top: 14 }}>CAM {cameraView ? '02 / TARGET LOCK' : '01 / WIDE'}</div>
-              <div className="scene-label scene-tag" style={{ right: 14, top: 14 }}>RRM MODULE · TARGET A</div>
-              {cameraView && <div className="scene-label scene-tag" style={{ left: '43%', top: 51, color: '#70e0e0' }}>VALVE ASSEMBLY IDENTIFIED</div>}
-              <svg viewBox="0 0 900 440" role="img" aria-label="Illustrative Dextre robotic arm reaching toward a refueling module">
+              <div className="scene-label scene-tag" style={{ left: 11, top: 11 }} data-testid="value-camera-mode">CAM // {cameraLabel.toUpperCase()} · {zoom.toFixed(1)}×</div>
+              <div className="scene-label scene-tag" style={{ right: 11, top: 11 }}>RRM SERVICE MODULE · TARGET A</div>
+              <svg viewBox={viewBox} role="img" aria-label={`Orbital servicing scene in ${cameraLabel} view. Robotic arm end effector at ${pose.endEffector.x.toFixed(0)}, ${pose.endEffector.y.toFixed(0)}; current target at ${target.x}, ${target.y}.`}>
                 <defs>
-                  <linearGradient id="moduleGrad" x1="0" x2="1"><stop stopColor="#344650"/><stop offset=".45" stopColor="#81939a"/><stop offset="1" stopColor="#485c65"/></linearGradient>
-                  <linearGradient id="armGrad" x1="0" y1="0" x2="1" y2="1"><stop stopColor="#d2d6cb"/><stop offset=".55" stopColor="#798b8d"/><stop offset="1" stopColor="#506770"/></linearGradient>
-                  <linearGradient id="tankLiquid" x1="0" x2="0" y1="0" y2="1"><stop stopColor="#3bd09b" stopOpacity=".55"/><stop offset="1" stopColor="#1e9d80" stopOpacity=".9"/></linearGradient>
+                  <linearGradient id="earth" x1="0" x2="1" y1="0" y2="1"><stop stopColor="#237d9a"/><stop offset=".45" stopColor="#17455e"/><stop offset="1" stopColor="#0c2436"/></linearGradient>
+                  <linearGradient id="module" x1="0" x2="1"><stop stopColor="#445b63"/><stop offset=".45" stopColor="#91a2a0"/><stop offset="1" stopColor="#435860"/></linearGradient>
+                  <linearGradient id="arm" x1="0" y1="0" x2="1" y2="1"><stop stopColor="#d8ded3"/><stop offset=".5" stopColor="#84999a"/><stop offset="1" stopColor="#526b73"/></linearGradient>
+                  <linearGradient id="fluid" x1="0" x2="0" y1="0" y2="1"><stop stopColor="#54d7a1" stopOpacity=".55"/><stop offset="1" stopColor="#23986f" stopOpacity=".95"/></linearGradient>
+                  <pattern id="blanket" width="12" height="12" patternUnits="userSpaceOnUse"><path d="M0 0L12 12M12 0L0 12" stroke="#9b9b78" strokeWidth=".7" opacity=".55"/></pattern>
                 </defs>
-                <g fill="#d0e4ed" opacity=".65">
-                  <circle cx="81" cy="77" r="1.4"/><circle cx="225" cy="49" r="1"/><circle cx="340" cy="85" r="1.4"/><circle cx="522" cy="63" r="1"/><circle cx="789" cy="85" r="1.3"/><circle cx="851" cy="165" r="1"/><circle cx="64" cy="212" r="1"/><circle cx="406" cy="35" r="1"/><circle cx="730" cy="45" r="1"/>
+                <rect x="-1000" y="-1000" width="3000" height="3000" fill="#0a1721"/>
+                <g fill="#d0e4ed" opacity=".64">
+                  <circle cx="81" cy="77" r="1.6"/><circle cx="225" cy="49" r="1.2"/><circle cx="340" cy="85" r="1.7"/><circle cx="522" cy="63" r="1.1"/><circle cx="789" cy="85" r="1.5"/><circle cx="951" cy="165" r="1"/><circle cx="64" cy="212" r="1"/><circle cx="406" cy="35" r="1.2"/><circle cx="730" cy="45" r="1.3"/><circle cx="588" cy="170" r="1"/><circle cx="274" cy="182" r="1.4"/>
                 </g>
-                <path d="M0 347 Q210 322 425 349 T900 342" fill="none" stroke="#314c59" strokeWidth="2" opacity=".65"/>
-                <g transform="translate(650 126)">
-                  <rect x="0" y="0" width="190" height="174" rx="5" fill="url(#moduleGrad)" stroke="#a4b4b4" strokeWidth="2"/>
-                  <path d="M12 17h165M12 28h165M13 148h162" stroke="#c4d0cc" opacity=".23"/>
-                  <rect x="17" y="42" width="79" height="73" fill="#283b44" stroke="#97a6a5"/>
-                  <path d="M24 49h65v58H24z" fill="#52666b"/>
-                  <path d="M34 55l25 44M70 55 42 103" stroke="#849594" opacity=".65"/>
-                  <rect x="111" y="34" width="61" height="94" fill="#3c4d53" stroke="#a3b1af"/>
-                  <text x="125" y="61" fill="#c0d0cc" fontSize="11" fontFamily="monospace">RRM</text>
-                  <text x="124" y="77" fill="#a6b9b7" fontSize="7" fontFamily="monospace">FUEL PORT</text>
-                  <g transform="translate(142 99)">
-                    <circle r="17" fill="#24343a" stroke="#c4d2cb" strokeWidth="2"/>
-                    <circle r="10" fill={capsRemoved ? '#3ed9d3' : '#b1a578'} stroke="#d2d3bc" strokeWidth="2"/>
-                    <circle r="5" fill="#15252a" stroke="#e3e9d9"/>
-                    {!capsRemoved && <path d="M-12-12L12 12M12-12L-12 12" stroke="#db7164" strokeWidth="3"/>}
-                    {wireCut ? null : <path d="M-21-3 Q-37 8 -20 20M18-6 Q34 4 20 20" fill="none" stroke="#e1aa5d" strokeWidth="2.4"/>}
-                    {secured && <circle r="22" fill="none" stroke="#52d0a4" strokeWidth="2" strokeDasharray="4 3"/>}
+                <circle cx="196" cy="132" r="143" fill="url(#earth)" stroke="#5aa4b6" strokeWidth="2" opacity=".9"/>
+                <path d="M72 120q25-54 83-43l15 23 35-4 11 25-38 18-9 28-48 12-19 37-38-21-15-39zM215 17l38 21 24 48-15 23-23-8-14-35-31-18z" fill="#367469" opacity=".58"/>
+                <path d="M28 285Q280 238 505 277T1050 264" fill="none" stroke="#31515d" strokeWidth="1.3" strokeDasharray="5 8"/>
+                <text x="65" y="307" fill="#638693" fontSize="9" fontFamily="monospace" letterSpacing="2">LOW EARTH ORBIT · SIMULATED SCENE</text>
+                {/* Service module chassis */}
+                <g>
+                  <path d="M718 108h220v246H718z" fill="url(#module)" stroke="#b7c8c2" strokeWidth="2"/>
+                  <path d="M729 120h197v14H729zM729 338h197v8H729z" fill="#293e48" stroke="#a4b5b4"/>
+                  <path d="M736 148h76v119h-76z" fill="#263a44" stroke="#9baead"/>
+                  <path d="M745 159h58v94h-58z" fill="url(#blanket)" stroke="#889895"/>
+                  {!mission.blanketCleared && <path d="M745 159h58l-12 34-24 14-22-12z" fill="url(#blanket)" stroke="#d2c88a" strokeWidth="2"><animate attributeName="d" dur=".45s" fill="freeze" values="M745 159h58v94h-58z;M745 159h58l-12 34-24 14-22-12z"/></path>}
+                  <text x="747" y="280" fill="#a3b8b7" fontSize="7" fontFamily="monospace">THERMAL BLANKET</text>
+                  <rect x="824" y="141" width="94" height="138" fill="#344a53" stroke="#acbcb8"/>
+                  <text x="837" y="163" fill="#cfddda" fontSize="13" fontFamily="monospace" letterSpacing="2">RRM</text>
+                  <text x="833" y="178" fill="#9db2b5" fontSize="7" fontFamily="monospace">FUEL PORT / A</text>
+                  {/* independent port, wires and removable cap */}
+                  <circle cx="840" cy="290" r="34" fill="#1a2e38" stroke="#bdcbc3" strokeWidth="2"/>
+                  <circle cx="840" cy="290" r="25" fill="#536971" stroke="#d0d7c9" strokeWidth="2"/>
+                  <circle cx="840" cy="290" r="14" fill={mission.capRemoved ? '#18333b' : '#998e68'} stroke="#d5d2b9" strokeWidth="2"/>
+                  <circle cx="840" cy="290" r="7" fill="#081820" stroke="#9eb0ab"/>
+                  {!mission.capRemoved && <g><path d="M829 279l22 22M851 279l-22 22" stroke="#d37869" strokeWidth="3"/><path d="M868 286h22v9h-22" fill="#c3b989" stroke="#ece1b0" strokeWidth="2"/><circle cx="891" cy="290" r="5" fill="#d6c994"/></g>}
+                  {!mission.wiresCut && <g fill="none" stroke="#e3b46b" strokeWidth="3"><path d="M813 274q-24-23-30 4t22 30"/><path d="M866 272q22-24 30 0t-21 36"/></g>}
+                  {mission.valveAccessed && <path d="M821 270l-16-19m16 19 18-16" stroke="#6bd3b4" strokeWidth="4"/>}
+                  <text x="817" y="338" fill="#a4b7b7" fontSize="7" fontFamily="monospace">SERVICE INTERFACE</text>
+                  {/* receiver vessel and simulated fluid */}
+                  <text x="848" y="202" fill="#b4c7c4" fontSize="7" fontFamily="monospace">RECEIVER TANK</text>
+                  <rect x="855" y="210" width="44" height="56" rx="3" fill="#142731" stroke="#9bafad" strokeWidth="2"/>
+                  <rect x="859" y={262 - 48 * mission.transferPercent / 100} width="36" height={Math.max(1, 48 * mission.transferPercent / 100)} fill="url(#fluid)" className="tank-fluid"/>
+                  <path d="M855 220h44M855 231h44M855 242h44M855 253h44" stroke="#6d8b8e" opacity=".45"/>
+                  <text x="861" y="276" fill="#93aaa9" fontSize="7" fontFamily="monospace">{mission.transferPercent}%</text>
+                  {/* tool storage bay */}
+                  <path d="M664 360h160v49H664z" fill="#384f58" stroke="#91a5a3" strokeWidth="2"/>
+                  <path d="M676 371h136v27H676z" fill="#172b35" stroke="#789196"/>
+                  <path d="M686 378h27v14h-27zm38 0h27v14h-27zm38 0h27v14h-27zm38 0h14v14h-14z" fill="#657d80" stroke="#a4b6b2"/>
+                  <text x="674" y="424" fill="#8ea4a6" fontSize="7" fontFamily="monospace">TOOL STORAGE BAY / 04</text>
+                  {/* truss / solar array structure */}
+                  <path d="M718 204h-92m0-61v122m-32-61h124M938 204h56m-15-46v94m-26-48h64" fill="none" stroke="#82989a" strokeWidth="5"/>
+                  <path d="M642 142v124m-22-124v124m-22-124v124M968 158v92m-22-92v92m44-92v92" stroke="#3e6975" strokeWidth="1"/>
+                  <path d="M620 142h98m-98 31h98m-98 31h98m-98 31h98M946 158h44m-44 31h44m-44 31h44m-44 30h44" stroke="#5d8792" strokeWidth="1"/>
+                </g>
+                {/* Manipulator base and true two-link pose */}
+                <g>
+                  <rect x="88" y="514" width="125" height="27" fill="#718785" stroke="#c0ccc1" strokeWidth="2"/>
+                  <rect x="109" y="541" width="84" height="43" fill="#344a53" stroke="#82999a"/>
+                  <path d="M124 584v21m53-21v21" stroke="#a2b1a8" strokeWidth="8"/>
+                  <circle cx={pose.base.x} cy={pose.base.y} r="30" fill="#445f67" stroke="#cfdbcf" strokeWidth="3"/>
+                  <circle cx={pose.base.x} cy={pose.base.y} r="13" fill="#182f38" stroke="#94abaa" strokeWidth="3"/>
+                  <line className="arm-part" x1={pose.base.x} y1={pose.base.y} x2={pose.elbow.x} y2={pose.elbow.y} stroke="url(#arm)" strokeWidth="30" strokeLinecap="round"/>
+                  <line x1={pose.base.x} y1={pose.base.y} x2={pose.elbow.x} y2={pose.elbow.y} stroke="#e0e5d7" strokeWidth="2" opacity=".5"/>
+                  <circle className="joint" cx={pose.elbow.x} cy={pose.elbow.y} r="25" fill="#647d80" stroke="#d1d9ce" strokeWidth="3"/>
+                  <circle cx={pose.elbow.x} cy={pose.elbow.y} r="10" fill="#1c343c" stroke="#a1b3ae" strokeWidth="3"/>
+                  <line className="arm-part" x1={pose.elbow.x} y1={pose.elbow.y} x2={pose.endEffector.x} y2={pose.endEffector.y} stroke="url(#arm)" strokeWidth="24" strokeLinecap="round"/>
+                  <line x1={pose.elbow.x} y1={pose.elbow.y} x2={pose.endEffector.x} y2={pose.endEffector.y} stroke="#e0e5d7" strokeWidth="1.6" opacity=".55"/>
+                  <circle className="joint" cx={pose.endEffector.x} cy={pose.endEffector.y} r="19" fill="#617a7d" stroke="#d1d8cc" strokeWidth="3"/>
+                  <circle cx={pose.endEffector.x} cy={pose.endEffector.y} r="7" fill="#1d3239" stroke="#8b9f9e" strokeWidth="2"/>
+                  <g transform={`translate(${pose.endEffector.x} ${pose.endEffector.y}) rotate(${pose.toolAngleDeg})`}>
+                    <path d="M0 16v18m-8 0h16" stroke="#c5d0c5" strokeWidth="6"/>
+                    {selectedTool === 'wire-blanket' ? <g stroke="#e5bc73" fill="none" strokeWidth="3"><path d="M-8 34l-11 15m11-15 8 15m-19-15h20"/><path d="M-14 35l-5-6m16 6 5-6"/></g> :
+                      selectedTool === 'cap-removal' ? <g stroke="#e6d28f" fill="none" strokeWidth="4"><path d="M-9 34v14m18-14v14M-10 48h20"/><circle cy="53" r="5"/></g> :
+                      selectedTool === 'nozzle' ? <g><path d="M0 34v17" stroke="#62d6d8" strokeWidth="5"/><path d={mission.nozzleConnected ? 'M0 51C0 77 8 81 26 84' : 'M0 51C-8 71-25 77-45 82'} fill="none" stroke="#42cbd1" strokeWidth="5"/><circle cx={mission.nozzleConnected ? 26 : -45} cy="82" r="6" fill="#66e0df"/></g> :
+                      <g stroke="#71d9bd" fill="none" strokeWidth="3"><path d="M0 34v21m-9 0 9 10 9-10"/><circle cy="50" r="10"/><path d="M-15 40l-7-6m37 6 7-6"/></g>}
                   </g>
-                  <rect x="122" y="140" width="39" height="22" fill="#162832" stroke="#7c959b"/>
-                  <rect x="126" y={161 - Math.max(3, transfer * .17)} width="31" height={Math.max(3, transfer * .17)} fill="url(#tankLiquid)" className="tank-fluid"/>
-                  <text x="124" y="138" fill="#9eb2b6" fontSize="6" fontFamily="monospace">RECEIVER TANK</text>
-                  <rect x="-11" y="64" width="11" height="48" fill="#87999a" stroke="#b7c4bd"/>
-                  <rect x="190" y="64" width="12" height="48" fill="#87999a" stroke="#b7c4bd"/>
-                  <path d="M-42 87h42M202 87h35M95-17v17M95 174v20" stroke="#869ca0" strokeWidth="5"/>
-                  <path d="M-42 87h-28m-15-20v40m15-20" stroke="#778e96" strokeWidth="4"/>
                 </g>
-                <g opacity=".8">
-                  <rect x="660" y="322" width="129" height="13" fill="#8fa1a0" stroke="#c5d1c8"/>
-                  <rect x="673" y="335" width="103" height="21" fill="#3b525a" stroke="#798f92"/>
-                  <path d="M691 356v21m66-21v21" stroke="#879995" strokeWidth="6"/>
-                  <path d="M662 322l-16-26m137 26 19-25" stroke="#798d91" strokeWidth="5"/>
+                {/* Hose path follows arm tip into the fuel port after capture */}
+                {mission.nozzleConnected && <path d={`M${pose.endEffector.x} ${pose.endEffector.y + 55} C${pose.endEffector.x + 40} ${pose.endEffector.y + 130}, 810 390, 840 290`} fill="none" stroke="#42cbd1" strokeWidth="5" strokeDasharray={mission.valveOpen ? '9 5' : 'none'}><animate attributeName="stroke-dashoffset" from="0" to="-28" dur="1s" repeatCount="indefinite"/></path>}
+                {mission.transferActive && <g fill="#8ff2d1"><circle r="4"><animateMotion dur="1.4s" repeatCount="indefinite" path="M840 290 C820 310 840 365 870 375"/></circle><circle r="3"><animateMotion dur="1.8s" repeatCount="indefinite" path="M840 290 C820 310 840 365 870 375"/></circle></g>}
+                {/* Capture target and crosshair tracking */}
+                <g aria-label="Current stage target">
+                  <circle cx={target.x} cy={target.y} r={alignment.tolerance} fill="none" stroke={targetReady ? '#65d99e' : '#51d3dc'} strokeWidth="1.5" strokeDasharray="4 4"/>
+                  <path d={`M${target.x - 13} ${target.y}h26M${target.x} ${target.y - 13}v26`} stroke={targetReady ? '#65d99e' : '#51d3dc'} strokeWidth="1.4"/>
+                  <circle cx={target.x} cy={target.y} r="3" fill="#72e1df"/>
+                  <text x={target.x + 20} y={target.y - 20} fill="#81dfe0" fontSize="8" fontFamily="monospace">TARGET / {mission.stage.toUpperCase()}</text>
                 </g>
                 <g>
-                  <rect x="87" y="336" width="92" height="23" rx="3" fill="#66797a" stroke="#b1c0b8" strokeWidth="2"/>
-                  <rect x="103" y="359" width="59" height="28" fill="#344b53" stroke="#809493"/>
-                  <path d="M117 387v22m34-22v22" stroke="#9caaa2" strokeWidth="6"/>
-                  <circle cx="133" cy="334" r="24" fill="#445d64" stroke="#c2ccc1" strokeWidth="3"/>
-                  <path d="M133 334 L355 253" stroke="url(#armGrad)" strokeWidth="27" strokeLinecap="round"/>
-                  <path d="M133 334 L355 253" stroke="#d5dbd0" strokeWidth="2" opacity=".6"/>
-                  <circle cx="355" cy="253" r="25" fill="#647a7c" stroke="#c9d1c7" strokeWidth="3"/>
-                  <circle cx="355" cy="253" r="10" fill="#1c343c" stroke="#98aaa5" strokeWidth="3"/>
-                  <line x1="355" y1="253" x2={position.x} y2={position.y} stroke="url(#armGrad)" strokeWidth="22" strokeLinecap="round" style={{ transition: 'all .25s ease' }}/>
-                  <line x1="355" y1="253" x2={position.x} y2={position.y} stroke="#d5dbd0" strokeWidth="1.5" opacity=".6"/>
-                  <circle cx={position.x} cy={position.y} r="19" fill="#60777a" stroke="#d1d8cc" strokeWidth="3" style={{ transition: 'all .25s ease' }}/>
-                  <circle cx={position.x} cy={position.y} r="7" fill="#1d3239" stroke="#8b9f9e" strokeWidth="2" style={{ transition: 'all .25s ease' }}/>
-                  <g transform={`translate(${position.x} ${position.y})`} style={{ transition: 'transform .25s ease' }}>
-                    <path d="M0 18v22m-10 0h20" stroke="#c5d0c5" strokeWidth="6"/>
-                    {selectedTool === 'wire-cutter' ? <path d="M-8 40l-10 15m10-15 8 15m-18-15 20 0" fill="none" stroke="#edb566" strokeWidth="4"/> :
-                     selectedTool === 'cap-tool' ? <path d="M-10 40v15m20-15v15M-10 54h20" fill="none" stroke="#e6c676" strokeWidth="5"/> :
-                      selectedTool === 'hose' ? <><path d="M0 40v8" stroke="#63ced4" strokeWidth="5"/><path d={secured ? `M0 48 C0 80 0 81 0 75` : 'M0 48 C-24 70 -34 72 -49 75'} fill="none" stroke="#42cad0" strokeWidth="5"/><circle cx={secured ? 0 : -49} cy="75" r="5" fill="#53d6d6"/></> :
-                     <><path d="M0 40v8" stroke="#81d4da" strokeWidth="5"/><circle cx="0" cy="53" r="8" fill="none" stroke="#76dbe0" strokeWidth="3"/><path d="M0 61v10" stroke="#76dbe0" strokeWidth="2"/></>}
-                  </g>
+                  <path d={`M${pose.endEffector.x - 9} ${pose.endEffector.y}h18M${pose.endEffector.x} ${pose.endEffector.y - 9}v18`} stroke="#f2cb76" strokeWidth="1"/>
+                  <circle cx={pose.endEffector.x} cy={pose.endEffector.y} r="4" fill="none" stroke="#f2cb76"/>
                 </g>
-                {aligned && phase === 3 && <g><circle cx="792" cy="225" r="30" fill="none" stroke="#5bdfbc" strokeWidth="1.5" strokeDasharray="5 4"/><path d="M772 225h40m-20-20v40" stroke="#5bdfbc" opacity=".7"/></g>}
-                <g transform="translate(30 38)" opacity=".8">
+                <g transform="translate(28 34)" opacity=".85">
                   <path d="M0 15h28M14 1v28" stroke="#57cbd2"/><circle cx="14" cy="15" r="9" fill="none" stroke="#57cbd2"/>
-                  <text x="37" y="18" fill="#6b8993" fontFamily="monospace" fontSize="8">LOCAL FRAME · RRM A</text>
+                  <text x="38" y="18" fill="#7897a1" fontFamily="monospace" fontSize="8">LOCAL FRAME · RRM A</text>
                 </g>
               </svg>
-              <div className="scene-label" style={{ right: 18, bottom: 17 }}>END EFFECTOR // {position.x}, {position.y}</div>
+              <div className="scene-label" style={{ right: 12, bottom: 12 }}>EE {pose.endEffector.x.toFixed(0)} / {pose.endEffector.y.toFixed(0)} · {alignment.withinTolerance ? 'CAPTURE READY' : 'TRACKING'}</div>
             </div>
             <div className="scene-control">
-              <span className="micro-label">End-effector X</span>
-              <div className="slider-wrap"><input aria-label="End effector horizontal position" data-testid="input-position-x" type="range" min="440" max="840" value={position.x} onChange={(event) => setPosition((p) => ({ ...p, x: Number(event.target.value) }))}/><span className="micro-label">{position.x}</span></div>
-              <span className="micro-label">Y</span>
-              <div className="slider-wrap"><input aria-label="End effector vertical position" data-testid="input-position-y" type="range" min="100" max="280" value={position.y} onChange={(event) => setPosition((p) => ({ ...p, y: Number(event.target.value) }))}/><span className="micro-label">{position.y}</span></div>
-              <button className="small-button" data-testid="button-reposition" onClick={() => { setPosition(valveTarget); setWarning(''); addLog('End effector repositioned to the calibrated valve target.'); }}>Reposition</button>
+              <span className="micro-label">Shoulder</span>
+              <div className="slider-wrap"><input aria-label="Shoulder joint angle" data-testid="input-joint-shoulder" type="range" min="-180" max="180" step="1" value={Math.round(angles.shoulderDeg)} onChange={(event) => setAngles((current) => ({ ...current, shoulderDeg: Number(event.target.value) }))}/><span className="micro-label" data-testid="value-shoulder-angle">{angles.shoulderDeg.toFixed(0)}°</span></div>
+              <span className="micro-label">Elbow</span>
+              <div className="slider-wrap"><input aria-label="Elbow joint angle" data-testid="input-joint-elbow" type="range" min="-180" max="180" step="1" value={Math.round(angles.elbowDeg)} onChange={(event) => setAngles((current) => ({ ...current, elbowDeg: Number(event.target.value) }))}/><span className="micro-label" data-testid="value-elbow-angle">{angles.elbowDeg.toFixed(0)}°</span></div>
+               <button className="small-button" data-testid="button-move-to-target" onClick={reposition} aria-label="Move manipulator to current target">Move to target</button>
             </div>
           </section>
+
           <aside className="side-column">
             <section className="panel">
-              <div className="panel-head"><span>Mission control</span><span className="head-right"><Gauge size={13}/> LIVE</span></div>
+              <div className="panel-head"><span>Mission control</span><span className="head-right"><Gauge size={12}/> LIVE</span></div>
               <div className="telemetry">
-                <div className="stage-name" data-testid="text-current-stage">{phase === 6 && !valveOpen ? 'Hose disconnect' : phaseTitle[phase] || 'Mission complete'}</div>
-                <div className="stage-hint">{phase === 0 ? 'Use the inspection camera to survey the service panel.' : phase === 1 ? 'Cut the two retaining safety wires without disturbing the valve.' : phase === 2 ? 'Remove both protective caps to expose the fuel port.' : phase === 3 ? 'Position the hose tip over the port, then secure the interface.' : phase === 4 ? 'Hose is captured. Open the valve to begin the simulated transfer.' : phase === 5 ? 'Ethanol analog is moving into the receiving tank.' : phase === 6 && valveOpen ? 'Transfer complete. Close the valve before disconnecting the hose.' : phase === 6 ? 'Select the hose to disconnect, then verify the closed valve with the camera.' : phase === 7 ? 'Confirm the closed valve and tank fill using the camera.' : 'All required servicing operations have been completed.'}</div>
+                <div className="stage-name" data-testid="text-current-stage">{currentStageLabel}</div>
+                <div className="stage-hint">{mission.stage === 'inspection' ? 'Survey the module from a focused camera before working near hardware.' : mission.stage === 'wire-clearance' ? 'Bring the mounted combination tool to the retaining wires and blanket edge.' : mission.stage === 'cap-removal' ? 'Remove and secure the protective cap without contacting the exposed port.' : mission.stage === 'valve-access' ? 'Open the valve guard using the Multifunction Tool.' : mission.stage === 'nozzle-connection' ? 'Align and capture the nozzle inside the target tolerance.' : mission.stage === 'transfer' ? mission.transferActive ? 'Illustrative fluid is moving into the receiver. Pause or monitor the fill.' : 'Nozzle secured. Open the valve to begin the simulated transfer.' : mission.stage === 'valve-closure' ? 'Tank target reached. Close the valve before disconnecting.' : mission.stage === 'disconnect' ? 'Disconnect the nozzle only after confirming the valve is closed.' : mission.stage === 'verification' ? 'Use Worksite Close-Up to confirm closed valve and filled tank.' : 'All required servicing operations are complete.'}</div>
                 <div className="telemetry-grid">
-                  <div className="metric"><label>Current tool</label><strong data-testid="value-tool">{tools.find((item) => item.id === selectedTool)?.name}</strong></div>
-                  <div className="metric"><label>Alignment</label><strong className={aligned ? 'green' : 'amber'} data-testid="value-alignment">{alignment}% {aligned ? '· LOCK' : '· ADJUST'}</strong></div>
-                  <div className="metric"><label>Hose connection</label><strong data-testid="value-connection" className={secured && !hoseDisconnected ? 'green' : ''}>{hoseDisconnected ? 'DISCONNECTED' : secured ? 'SECURED' : 'OPEN'}</strong></div>
-                  <div className="metric"><label>Mission state</label><strong data-testid="value-mission-state" className={phase >= 8 ? 'green' : ''}>{phase >= 8 ? 'SUCCESS' : transferActive ? 'TRANSFERRING' : 'IN PROGRESS'}</strong></div>
+                  <div className="metric"><label>Mounted tool</label><strong>{getToolName(selectedTool)}</strong></div>
+                  <div className="metric"><label>Tool readiness</label><strong className={requiredTool === selectedTool || !requiredTool ? 'green' : 'amber'}>{requiredTool ? isToolAvailable(selectedTool, mission.stage) ? 'READY' : `USE ${getToolName(requiredTool)}` : 'NO TOOL REQUIRED'}</strong></div>
+                  <div className="metric"><label>Alignment</label><strong className={targetReady ? 'green' : 'amber'} data-testid="value-alignment">{alignment.alignmentPercent}% · {targetReady ? 'IN TOLERANCE' : 'ADJUST'}</strong></div>
+                  <div className="metric"><label>Target distance</label><strong data-testid="value-target-distance">{alignment.distance.toFixed(1)} / {alignment.tolerance} px</strong></div>
+                  <div className="metric"><label>Alignment error</label><strong data-testid="value-alignment-error">{alignment.distance.toFixed(1)} px</strong></div>
+                  <div className="metric"><label>End effector X / Y</label><strong><span data-testid="value-end-effector-x">{pose.endEffector.x.toFixed(1)}</span> / <span data-testid="value-end-effector-y">{pose.endEffector.y.toFixed(1)}</span></strong></div>
+                  <div className="metric"><label>Target X / Y</label><strong><span data-testid="value-target-x">{target.x}</span> / <span data-testid="value-target-y">{target.y}</span></strong></div>
+                  <div className="metric"><label>Connection</label><strong className={mission.nozzleConnected ? 'green' : ''}>{mission.nozzleConnected ? 'CONNECTED' : 'OPEN'}</strong></div>
+                  <div className="metric"><label>Fuel valve</label><strong className={mission.valveOpen ? 'amber' : 'green'} data-testid="value-valve-status">{mission.valveOpen ? 'OPEN' : 'CLOSED'}</strong></div>
+                  <div className="metric"><label>Mission state</label><strong className={mission.stage === 'complete' ? 'green' : ''}>{mission.stage === 'complete' ? 'SUCCESS' : mission.transferActive ? 'TRANSFERRING' : 'IN PROGRESS'}</strong></div>
                 </div>
-                <div className="metric" style={{ marginTop: 8 }}><label>Simulated ethanol transfer <span style={{ float: 'right' }}>{transfer}%</span></label><div className="transfer-bar"><span style={{ width: `${transfer}%` }}/></div></div>
+                <div className="metric" style={{ marginTop: 7 }}><label>Simulated ethanol analog <span style={{ float: 'right' }}>{mission.transferPercent}%</span></label><div className="transfer-bar"><span style={{ width: `${mission.transferPercent}%` }}/></div><strong data-testid="value-transfer-liters">{liters.toFixed(2)} L / {TANK_CAPACITY_LITERS} L</strong><span className="micro-label" data-testid="value-transfer-rate">Illustrative rate · {SIMULATED_TRANSFER_RATE_LPS.toFixed(1)} L/s</span></div>
+                <div className="micro-label" style={{ marginTop: 6 }}>Simulated volume only — not real telemetry</div>
                 {warning && <div className="warning" role="alert" data-testid="status-warning">{warning}</div>}
-                {phase >= 8 && <div className="warning success-note" data-testid="text-completion-summary"><strong>Transfer summary</strong><br/>Ethanol analog: {transfer}% tank capacity · valve closed · hose disconnected · visual verification passed.</div>}
+                {mission.stage === 'complete' && <div className="warning success-note"><strong>Mission report</strong><br/>Verified volume: {liters.toFixed(2)} L of {TANK_CAPACITY_LITERS} L. Valve closed; nozzle disconnected; worksite visually verified. All values are simplified instructional mechanics.</div>}
                 <div className="action-row">
-                  {phase < 8 && !(phase === 6 && valveOpen) && <button className="primary-button" data-testid="button-primary-action" onClick={performAction} disabled={transferActive}>{actionLabel}</button>}
-                  {phase === 5 && <button className="small-button" data-testid="button-pause-transfer" onClick={() => { setTransferActive((active) => !active); addLog(transferActive ? 'Transfer paused at the current tank level.' : 'Transfer resumed.'); }}>{transferActive ? 'Pause transfer' : 'Resume transfer'}</button>}
-                  {phase === 6 && valveOpen && <button className="primary-button" data-testid="button-close-valve" onClick={closeValve}>Close valve</button>}
-                  {phase >= 8 && <button className="primary-button" data-testid="button-reset-success" onClick={reset}>Run again</button>}
-                  <button className="danger-button" data-testid="button-reset-mission" onClick={reset} aria-label="Reset mission"><RotateCcw size={13}/> Reset</button>
+                  {mission.stage !== 'complete' && mission.stage !== 'transfer' && <button className="primary-button" data-testid="button-primary-action" onClick={operate}>{actionLabel}</button>}
+                  {mission.stage === 'transfer' && !mission.valveOpen && !mission.transferActive && <button className="primary-button" data-testid="button-primary-action" onClick={operate}>{actionLabel}</button>}
+                  {mission.stage === 'transfer' && <button className="small-button" data-testid="button-pause-transfer" onClick={() => { setMission((current) => ({ ...current, transferActive: !current.transferActive })); addLog(mission.transferActive ? 'Transfer paused at current receiver level.' : 'Transfer resumed.'); }}>{mission.transferActive ? 'Pause transfer' : 'Resume transfer'}</button>}
+                  {mission.stage === 'complete' && <button className="primary-button" onClick={reset}>Run again</button>}
+                  <button className="danger-button" data-testid="button-reset-mission" onClick={reset} aria-label="Reset all mission state"><RotateCcw size={12}/> Reset</button>
                 </div>
-                {phase === 5 && <div className="micro-label" style={{ marginTop: 8 }}>Transfer advances automatically; pause remains available.</div>}
+                {mission.stage === 'transfer' && <div className="micro-label" style={{ marginTop: 7 }}>Rate {SIMULATED_TRANSFER_RATE_LPS.toFixed(1)} L/s · tank {TANK_CAPACITY_LITERS} L · accelerated illustrative timing.</div>}
               </div>
             </section>
+
             <section className="panel tool-panel">
-              <div className="panel-head" style={{ margin: '0 -13px' }}><span>Tool changer</span><span className="head-right"><Hand size={13}/> ARM 2</span></div>
+              <div className="panel-head" style={{ margin: '0 -11px' }}><span>Tool changer</span><span className="head-right"><Hand size={12}/> ARM 2</span></div>
               <div className="tool-list">
-                {tools.map(({ id, name, icon: Icon }) => <button key={id} className={`tool-button ${selectedTool === id ? 'active' : ''}`} data-testid={`button-tool-${id}`} onClick={() => selectTool(id)} aria-pressed={selectedTool === id}>
-                  <span className="tool-name"><span className="tool-icon"><Icon size={15}/></span>{name}</span><span className="tool-state">{selectedTool === id ? 'ACTIVE' : 'SELECT'}</span>
+                {tools.map(({ id, icon: Icon }) => <button key={id} className={`tool-button ${selectedTool === id ? 'active' : ''} ${requiredTool === id ? 'ready' : ''}`} data-testid={toolTestIds[id]} onClick={() => selectTool(id)} aria-pressed={selectedTool === id}>
+                  <span className="tool-name"><span className="tool-icon"><Icon size={14}/></span>{getToolName(id)}</span><span className="tool-state">{selectedTool === id ? 'MOUNTED' : requiredTool === id ? 'REQUIRED' : 'STOWED'}</span>
                 </button>)}
               </div>
-              <div className="micro-label" style={{ marginTop: 9 }}>Selected tool is mounted at end effector.</div>
+              <div className="micro-label" style={{ marginTop: 7 }}>Selecting a tool changes the end-effector geometry and operation readiness.</div>
+              <div className="control-group">
+                <div className="control-head"><span className="micro-label">Camera / tracking view</span><span className="micro-label">{cameraLabel.toUpperCase()}</span></div>
+                <div className="camera-row">{cameraModes.map((mode) => <button key={mode.id} className={`camera-button ${cameraMode === mode.id ? 'active' : ''}`} data-testid={mode.testId} onClick={() => setCamera(mode.id)} aria-pressed={cameraMode === mode.id}>{mode.label}</button>)}</div>
+              </div>
+              <div className="control-group">
+                <div className="control-head"><label htmlFor="grip-range" className="micro-label">Safe-grip force</label><span className="micro-label">{gripForce}%{gripWindow ? ` · ${gripWindow[0]}–${gripWindow[1]}%` : ''}</span></div>
+                <input id="grip-range" aria-label="Safe-grip force" data-testid="input-grip-force" type="range" min="0" max="100" value={gripForce} onChange={(event) => updateGrip(Number(event.target.value))}/>
+              </div>
+              <div className="control-group">
+                <div className="control-head"><label htmlFor="zoom-range" className="micro-label">Scene magnification</label><span className="micro-label">{zoom.toFixed(1)}×</span></div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}><ZoomOut size={13} color="#7e9ba5"/><input id="zoom-range" aria-label="Scene zoom" data-testid="input-zoom" type="range" min="1" max="2.8" step=".1" value={zoom} onChange={(event) => setZoom(Number(event.target.value))}/><ZoomIn size={13} color="#7e9ba5"/></div>
+              </div>
+              <div className="telemetry-inline">
+                <div className="metric"><label>Shoulder angle</label><strong data-testid="value-shoulder-angle-readout">{angles.shoulderDeg.toFixed(1)}°</strong></div>
+                <div className="metric"><label>Elbow angle</label><strong data-testid="value-elbow-angle-readout">{angles.elbowDeg.toFixed(1)}°</strong></div>
+              </div>
             </section>
           </aside>
         </div>
         <section className="panel log-panel">
-          <div className="panel-head"><span>Operation log</span><span className="head-right"><Crosshair size={12}/> SEQUENCE RECORD</span></div>
+          <div className="panel-head"><span>Operation log / mission clock</span><span className="head-right"><Crosshair size={11}/> SEQUENCE RECORD · {log.length} EVENTS</span></div>
           <div className="log-list" aria-live="polite" data-testid="list-operation-log">
             {log.map((entry, index) => <div className={`log-entry ${entry.warn ? 'warn' : ''}`} key={`${entry.time}-${index}`} data-testid={`log-entry-${index}`}><span className="log-time">{entry.time}</span><span className="log-mark">{entry.warn ? '!' : '›'}</span><span>{entry.message}</span></div>)}
           </div>
         </section>
-        <div className="footer-note"><span><ShieldCheck size={12} style={{ verticalAlign: 'middle', marginRight: 5 }}/>Illustrative recreation inspired by NASA’s Robotic Refueling Mission experiment.</span><span>Physical measurements, animation, fluid transfer and robotic mechanics are simplified for education.</span></div>
+        <div className="footer-note"><span><ShieldCheck size={11} style={{ verticalAlign: 'middle', marginRight: 5 }}/>Educational orbital servicing simulation inspired by RRM.</span><span>Measurements, mechanics, timing and fluid transfer are simplified; this is not NASA software or flight telemetry.</span></div>
       </div>
     </main>
   );
