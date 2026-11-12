@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "RRM Mission Simulator"
+description = "An interactive educational 2D simulation of NASA’s Robotic Refueling Mission, guiding users through a simplified robotic servicing sequence with tools, telemetry, and mission controls."
+version = "1.0.0"
+id = "artifacts/rrm-simulator"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 23430
+
+[services.development]
+run = "pnpm --filter @workspace/rrm-simulator run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/rrm-simulator", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/rrm-simulator/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "23430"
+BASE_PATH = "/"
