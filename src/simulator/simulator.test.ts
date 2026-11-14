@@ -10,10 +10,14 @@ import {
 import {
   ARM_GEOMETRY,
   forwardKinematics,
+  interpolateJointAngles,
+  isJointAngleWithinLimits,
   measureAlignment,
+  solveReachableTarget,
   solveInverseKinematics,
   targetForStage,
 } from './kinematics.ts';
+import { planAutonomousInstruction } from './autonomy.ts';
 
 const aligned = {
   distance: 0,
@@ -44,6 +48,51 @@ test('forward kinematics and inverse solve agree at the valve target', () => {
 
   assert.ok(alignment.withinTolerance);
   assert.ok(alignment.distance < 1);
+});
+
+test('constrained inverse kinematics solves every mission target within joint limits', () => {
+  const stages = [
+    'inspection',
+    'wire-clearance',
+    'cap-removal',
+    'valve-access',
+    'nozzle-connection',
+    'transfer',
+    'valve-closure',
+    'disconnect',
+    'verification',
+  ] as const;
+
+  for (const stage of stages) {
+    const target = targetForStage(stage);
+    const result = solveReachableTarget(target);
+    assert.equal(result.reachable, true, `${stage} target should be reachable`);
+    if (!result.reachable) continue;
+    assert.equal(isJointAngleWithinLimits(result.angles), true);
+    assert.ok(measureAlignment(forwardKinematics(result.angles).endEffector, target).distance < 1);
+  }
+});
+
+test('unreachable targets and targets blocked by joint limits report clear reasons', () => {
+  const outsideWorkspace = solveReachableTarget({ x: 1000, y: 0 });
+  const outsideJointLimits = solveReachableTarget({ x: 150, y: 680 });
+
+  assert.equal(outsideWorkspace.reachable, false);
+  if (!outsideWorkspace.reachable) assert.match(outsideWorkspace.reason, /reachable workspace/i);
+  assert.equal(outsideJointLimits.reachable, false);
+  if (!outsideJointLimits.reachable) assert.match(outsideJointLimits.reason, /joint limits/i);
+  assert.equal(isJointAngleWithinLimits({ shoulderDeg: 0, elbowDeg: 180 }), false);
+});
+
+test('joint interpolation eases between manual and assisted poses', () => {
+  const start = { shoulderDeg: -30, elbowDeg: 20 };
+  const end = { shoulderDeg: 50, elbowDeg: 100 };
+
+  assert.deepEqual(interpolateJointAngles(start, end, 0), start);
+  assert.deepEqual(interpolateJointAngles(start, end, 1), end);
+  const middle = interpolateJointAngles(start, end, 0.5);
+  assert.equal(middle.shoulderDeg, 10);
+  assert.equal(middle.elbowDeg, 60);
 });
 
 test('alignment reports a miss outside the capture tolerance', () => {
@@ -115,4 +164,19 @@ test('the full mission enforces order and finishes with a verified transfer', ()
   assert.equal(state.verified, true);
   assert.equal(state.transferPercent * TANK_CAPACITY_LITERS / 100, TANK_CAPACITY_LITERS);
   assert.equal(SIMULATED_TRANSFER_RATE_LPS, 1.2);
+});
+
+test('autonomous instructions follow the shared mission stage, tool, target, and grip rules', () => {
+  let state = createInitialMissionState();
+  const inspection = planAutonomousInstruction(state);
+  assert.equal(inspection?.stage, 'inspection');
+  assert.equal(inspection?.cameraMode, 'worksite');
+
+  state = { ...state, stage: 'wire-clearance' };
+  const wireStep = planAutonomousInstruction(state);
+  assert.equal(wireStep?.tool, 'wire-blanket');
+  assert.deepEqual(wireStep?.target, targetForStage('wire-clearance'));
+  assert.ok(wireStep?.gripForce && wireStep.gripForce >= 35 && wireStep.gripForce <= 70);
+
+  assert.equal(planAutonomousInstruction({ ...state, stage: 'complete' }), null);
 });

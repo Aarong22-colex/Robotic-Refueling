@@ -1,4 +1,4 @@
-import { type ReactNode, useEffect, useMemo, useState } from 'react';
+import { type MouseEvent, type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { ErrorBoundary } from '@/components/error-boundary';
 import { Toaster } from '@/components/ui/toaster';
@@ -7,7 +7,8 @@ import NotFound from '@/pages/not-found';
 import { Route, Switch, useLocation, Router as WouterRouter } from 'wouter';
 import { Aperture, Check, CheckCircle2, CircleDot, Crosshair, Gauge, Hand, RotateCcw, Scissors, ShieldCheck, Unplug, Wrench, ZoomIn, ZoomOut } from 'lucide-react';
 import { advanceTransfer, attemptMissionOperation, createInitialMissionState, getGripWindow, getRequiredTool, getToolName, isToolAvailable, MISSION_STEPS, SIMULATED_TRANSFER_RATE_LPS, TANK_CAPACITY_LITERS, type CameraMode, type ToolId } from './simulator/mission';
-import { ARM_GEOMETRY, forwardKinematics, measureAlignment, solveInverseKinematics, targetForStage, type JointAngles } from './simulator/kinematics';
+import { forwardKinematics, interpolateJointAngles, JOINT_LIMITS, measureAlignment, solveInverseKinematics, solveReachableTarget, targetForStage, type JointAngles, type Point } from './simulator/kinematics';
+import { planAutonomousInstruction, type OperatingMode } from './simulator/autonomy';
 
 type Entry = { time: string; message: string; warn?: boolean };
 const queryClient = new QueryClient();
@@ -36,38 +37,165 @@ function App() {
   const [selectedTool, setSelectedTool] = useState<ToolId>('wire-blanket');
   const [cameraMode, setCameraMode] = useState<CameraMode>('overview');
   const [angles, setAngles] = useState<JointAngles>(initialAngles);
+  const [mode, setMode] = useState<OperatingMode>('manual');
+  const [autoState, setAutoState] = useState<'idle' | 'running' | 'paused' | 'stopped' | 'error' | 'complete'>('idle');
+  const [selectedTarget, setSelectedTarget] = useState<Point>(targetForStage('inspection'));
+  const [motionActive, setMotionActive] = useState(false);
   const [gripForce, setGripForce] = useState(50);
   const [zoom, setZoom] = useState(1);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [warning, setWarning] = useState('');
   const [log, setLog] = useState<Entry[]>([{ time: '00:00:00', message: 'Simulation initialized. Manipulator parked at survey pose.' }]);
+  const elapsedRef = useRef(0);
+  const missionRef = useRef(mission);
+  const anglesRef = useRef(angles);
+  const modeRef = useRef(mode);
+  const autoStateRef = useRef(autoState);
+  const pauseRef = useRef(false);
+  const runTokenRef = useRef(0);
+  const frameRef = useRef<number | null>(null);
+  const motionResolveRef = useRef<((value: boolean) => void) | null>(null);
+  const mountedRef = useRef(true);
+  const svgRef = useRef<SVGSVGElement>(null);
   const target = useMemo(() => targetForStage(mission.stage), [mission.stage]);
   const pose = useMemo(() => forwardKinematics(angles), [angles]);
   const alignment = useMemo(() => measureAlignment(pose.endEffector, target), [pose.endEffector, target]);
+  const selectedIk = useMemo(() => solveReachableTarget(selectedTarget, angles), [selectedTarget, angles]);
+  const stageIk = useMemo(() => solveReachableTarget(target, angles), [target, angles]);
   const requiredTool = getRequiredTool(mission.stage);
   const liters = TANK_CAPACITY_LITERS * mission.transferPercent / 100;
   const cameraLabel = cameraModes.find((mode) => mode.id === cameraMode)?.label ?? 'Overview';
   const stageIndex = MISSION_STEPS.findIndex((step) => step.id === mission.stage);
   const currentStageLabel = mission.stage === 'complete' ? 'Mission complete' : MISSION_STEPS[stageIndex]?.label ?? 'Mission operation';
   const gripWindow = getGripWindow(mission.stage);
+  const selectedToolRef = useRef(selectedTool);
+  const cameraRef = useRef(cameraMode);
+  const gripRef = useRef(gripForce);
 
   const addLog = (message: string, warn = false) => {
-    const stamp = formatElapsed(elapsedSeconds);
+    const stamp = formatElapsed(elapsedRef.current);
     setLog((items) => [{ time: stamp, message, warn }, ...items].slice(0, 40));
   };
   const raiseWarning = (message: string) => {
     setWarning(message);
     addLog(message, true);
   };
+  const commitMission = (next: typeof mission | ((current: typeof mission) => typeof mission)) => {
+    const value = typeof next === 'function' ? next(missionRef.current) : next;
+    missionRef.current = value;
+    setMission(value);
+  };
+  const commitAngles = (next: JointAngles) => {
+    anglesRef.current = next;
+    setAngles(next);
+  };
+  const setAutoStatus = (value: typeof autoState) => {
+    autoStateRef.current = value;
+    setAutoState(value);
+  };
+  const cancelMotion = () => {
+    runTokenRef.current += 1;
+    pauseRef.current = false;
+    if (frameRef.current !== null) window.cancelAnimationFrame(frameRef.current);
+    frameRef.current = null;
+    motionResolveRef.current?.(false);
+    motionResolveRef.current = null;
+    setMotionActive(false);
+  };
+  const animateTo = (destination: JointAngles, token: number) => new Promise<boolean>((resolve) => {
+    motionResolveRef.current = resolve;
+    const start = { ...anglesRef.current };
+    const duration = window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 1 : 760;
+    let elapsed = 0;
+    let previous = performance.now();
+    setMotionActive(true);
+    const tick = (now: number) => {
+      if (!mountedRef.current || token !== runTokenRef.current) {
+        setMotionActive(false);
+        motionResolveRef.current = null;
+        resolve(false);
+        return;
+      }
+      if (pauseRef.current) {
+        previous = now;
+        frameRef.current = window.requestAnimationFrame(tick);
+        return;
+      }
+      elapsed += Math.max(0, now - previous);
+      previous = now;
+      const progress = Math.min(1, elapsed / duration);
+      commitAngles(interpolateJointAngles(start, destination, progress));
+      if (progress < 1) frameRef.current = window.requestAnimationFrame(tick);
+      else {
+        frameRef.current = null;
+        setMotionActive(false);
+        motionResolveRef.current = null;
+        resolve(true);
+      }
+    };
+    frameRef.current = window.requestAnimationFrame(tick);
+  });
+  const applyOperation = (state: typeof mission, tool: ToolId | null, camera: CameraMode, force: number) => {
+    const currentPose = forwardKinematics(anglesRef.current);
+    const activeTarget = targetForStage(state.stage);
+    const currentAlignment = measureAlignment(currentPose.endEffector, activeTarget);
+    return attemptMissionOperation(state, { tool, cameraMode: camera, alignment: currentAlignment, gripForce: force });
+  };
+  const chooseMode = (next: OperatingMode) => {
+    if (modeRef.current === next) return;
+    cancelMotion();
+    if (autoStateRef.current === 'running' || autoStateRef.current === 'paused') {
+      const current = missionRef.current;
+      commitMission({ ...current, valveOpen: false, transferActive: false });
+      setAutoStatus('stopped');
+      addLog('Autonomous run stopped by operating-mode change; valve closed and progress retained.');
+    }
+    modeRef.current = next;
+    setMode(next);
+    setWarning('');
+    addLog(`${next[0].toUpperCase()}${next.slice(1)} operating mode selected.`);
+  };
+  const selectTarget = (point: Point) => {
+    if (mode === 'autonomous' && (autoState === 'running' || autoState === 'paused')) return;
+    setSelectedTarget(point);
+    const solution = solveReachableTarget(point, anglesRef.current);
+    if (!solution.reachable) {
+      setWarning(solution.reason);
+    } else {
+      setWarning('');
+    }
+  };
+  const workspaceClick = (event: MouseEvent<SVGSVGElement>) => {
+    if (mode === 'autonomous' || !svgRef.current) return;
+    const svg = svgRef.current;
+    const matrix = svg.getScreenCTM();
+    if (!matrix) return;
+    const point = svg.createSVGPoint();
+    point.x = event.clientX;
+    point.y = event.clientY;
+    const local = point.matrixTransform(matrix.inverse());
+    selectTarget({ x: Math.round(local.x), y: Math.round(local.y) });
+  };
+  const confirmAssistedMove = async () => {
+    if (mode !== 'assisted' || !selectedIk.reachable) return;
+    cancelMotion();
+    const token = runTokenRef.current;
+    addLog(`Assisted move confirmed: target ${selectedTarget.x}, ${selectedTarget.y}.`);
+    const moved = await animateTo(selectedIk.angles, token);
+    if (moved) addLog('Manipulator reached the confirmed target pose.');
+  };
 
   useEffect(() => {
-    const timer = window.setInterval(() => setElapsedSeconds((seconds) => seconds + 1), 1000);
+    const timer = window.setInterval(() => setElapsedSeconds((seconds) => {
+      elapsedRef.current = seconds + 1;
+      return seconds + 1;
+    }), 1000);
     return () => window.clearInterval(timer);
   }, []);
 
   useEffect(() => {
     if (!mission.transferActive) return;
-    const timer = window.setInterval(() => setMission((current) => advanceTransfer(current, 2)), 200);
+    const timer = window.setInterval(() => commitMission((current) => advanceTransfer(current, 2)), 200);
     return () => window.clearInterval(timer);
   }, [mission.transferActive]);
 
@@ -80,45 +208,84 @@ function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mission.stage]);
 
+  useEffect(() => {
+    selectedToolRef.current = selectedTool;
+    cameraRef.current = cameraMode;
+    gripRef.current = gripForce;
+  }, [selectedTool, cameraMode, gripForce]);
+  useEffect(() => {
+    modeRef.current = mode;
+  }, [mode]);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      if (frameRef.current !== null) window.cancelAnimationFrame(frameRef.current);
+      runTokenRef.current += 1;
+      motionResolveRef.current?.(false);
+      motionResolveRef.current = null;
+    };
+  }, []);
+
   const selectTool = (tool: ToolId) => {
+    if (mode === 'autonomous' && (autoState === 'running' || autoState === 'paused')) return;
     setSelectedTool(tool);
     setWarning('');
     addLog(`${getToolName(tool)} mounted at the end effector.`);
   };
   const operate = () => {
+    if (mode === 'autonomous') return;
     setWarning('');
-    const result = attemptMissionOperation(mission, { tool: selectedTool, cameraMode, alignment, gripForce });
+    const result = applyOperation(missionRef.current, selectedTool, cameraMode, gripForce);
     if (result.warning) {
       setWarning(result.warning);
       addLog(result.warning, true);
       return;
     }
-    setMission(result.state);
+    commitMission(result.state);
+    if (result.state.stage !== mission.stage) setSelectedTarget(targetForStage(result.state.stage));
     if (result.event) addLog(result.event);
   };
   const setCamera = (mode: CameraMode) => {
+    if (modeRef.current === 'autonomous' && (autoStateRef.current === 'running' || autoStateRef.current === 'paused')) return;
     setCameraMode(mode);
     setWarning('');
     addLog(`${cameraModes.find((item) => item.id === mode)?.label} selected.`);
   };
   const updateGrip = (value: number) => {
+    if (mode === 'autonomous' || autoState === 'running' || autoState === 'paused') return;
     setGripForce(value);
     if (gripWindow && (value < gripWindow[0] || value > gripWindow[1])) {
       setWarning(`Grip ${value}% is outside the current safe window (${gripWindow[0]}–${gripWindow[1]}%). Adjust before contact.`);
     } else setWarning('');
   };
-  const reposition = () => {
-    setAngles(solveInverseKinematics(target));
+  const reposition = async () => {
+    if (mode !== 'manual') return;
+    const result = solveReachableTarget(target, anglesRef.current);
+    if (!result.reachable) {
+      setWarning(result.reason);
+      return;
+    }
+    cancelMotion();
+    const token = runTokenRef.current;
+    const moved = await animateTo(result.angles, token);
+    if (!moved) return;
     setWarning('');
-    addLog('Manipulator moved to the current stage target using inverse kinematics.');
+    addLog('Manipulator moved to the current stage target using constrained inverse kinematics.');
   };
   const reset = () => {
-    setMission(createInitialMissionState());
+    cancelMotion();
+    setAutoStatus('idle');
+    commitMission(createInitialMissionState());
     setSelectedTool('wire-blanket');
     setCameraMode('overview');
-    setAngles(initialAngles());
+    commitAngles(initialAngles());
+    setSelectedTarget(targetForStage('inspection'));
+    modeRef.current = 'manual';
+    setMode('manual');
     setGripForce(50);
     setZoom(1);
+    elapsedRef.current = 0;
     setElapsedSeconds(0);
     setWarning('');
     setLog([{ time: '00:00:00', message: 'Simulation reset. Manipulator returned to survey pose.' }]);
@@ -138,6 +305,99 @@ function App() {
   const viewHeight = 650 / zoom;
   const viewBox = `${viewCenter.x - viewWidth / 2} ${viewCenter.y - viewHeight / 2} ${viewWidth} ${viewHeight}`;
   const targetReady = alignment.withinTolerance;
+  const autoLocked = mode === 'autonomous' && (autoState === 'running' || autoState === 'paused');
+
+  const runAutonomy = async () => {
+    if (missionRef.current.stage === 'complete' || (autoStateRef.current !== 'idle' && autoStateRef.current !== 'stopped' && autoStateRef.current !== 'error')) return;
+    cancelMotion();
+    const token = runTokenRef.current;
+    pauseRef.current = false;
+    setAutoStatus('running');
+    setWarning('');
+    addLog('SIMULATED AUTONOMY started. Executing the shared nine-step mission plan.');
+    try {
+      while (token === runTokenRef.current && !missionIsComplete()) {
+        while (pauseRef.current && token === runTokenRef.current) await new Promise((resolve) => window.setTimeout(resolve, 80));
+        if (token !== runTokenRef.current) return;
+        const currentState = missionRef.current;
+        const instruction = planAutonomousInstruction(currentState);
+        if (!instruction) break;
+        const reach = solveReachableTarget(instruction.target, anglesRef.current);
+        if (!reach.reachable) throw new Error(reach.reason);
+        if (selectedToolRef.current !== instruction.tool && instruction.tool) {
+          setSelectedTool(instruction.tool);
+          selectedToolRef.current = instruction.tool;
+          addLog(`${getToolName(instruction.tool)} mounted for ${instruction.stage}.`);
+        }
+        if (cameraRef.current !== instruction.cameraMode) {
+          setCameraMode(instruction.cameraMode);
+          cameraRef.current = instruction.cameraMode;
+          addLog(`${cameraModes.find((item) => item.id === instruction.cameraMode)?.label} selected for ${instruction.stage}.`);
+        }
+        if (gripRef.current !== instruction.gripForce) {
+          setGripForce(instruction.gripForce);
+          gripRef.current = instruction.gripForce;
+        }
+        setSelectedTarget(instruction.target);
+        addLog(`Autonomy moving to ${instruction.stage} target (${instruction.target.x}, ${instruction.target.y}).`);
+        const reached = await animateTo(reach.angles, token);
+        if (!reached || token !== runTokenRef.current) return;
+        const operationPose = forwardKinematics(anglesRef.current);
+        const operationAlignment = measureAlignment(operationPose.endEffector, instruction.target);
+        if (!operationAlignment.withinTolerance) throw new Error(`Alignment check failed at ${instruction.stage}: ${operationAlignment.distance.toFixed(1)} px from target.`);
+        const result = attemptMissionOperation(missionRef.current, {
+          tool: instruction.tool,
+          cameraMode: instruction.cameraMode,
+          alignment: operationAlignment,
+          gripForce: instruction.gripForce,
+        });
+        if (result.warning) throw new Error(result.warning);
+        commitMission(result.state);
+        if (result.event) addLog(result.event);
+        if (instruction.stage === 'transfer') {
+          while (missionRef.current.stage === 'transfer' && token === runTokenRef.current) {
+            while (pauseRef.current && token === runTokenRef.current) await new Promise((resolve) => window.setTimeout(resolve, 80));
+            if (token !== runTokenRef.current) return;
+            if (!missionRef.current.transferActive && missionRef.current.valveOpen) commitMission((current) => ({ ...current, transferActive: true }));
+            await new Promise((resolve) => window.setTimeout(resolve, 100));
+          }
+        }
+      }
+      if (token === runTokenRef.current) {
+        setAutoStatus('complete');
+        addLog('SIMULATED AUTONOMY completed the mission report.');
+      }
+    } catch (error) {
+      if (token !== runTokenRef.current) return;
+      const reason = error instanceof Error ? error.message : 'Autonomous sequence failed.';
+      commitMission((current) => ({ ...current, valveOpen: false, transferActive: false }));
+      setAutoStatus('error');
+      setWarning(`Autonomy stopped: ${reason}`);
+      addLog(`Autonomy stopped: ${reason}`, true);
+    }
+  };
+  const pauseAutonomy = () => {
+    if (autoState !== 'running') return;
+    pauseRef.current = true;
+    commitMission((current) => current.transferActive ? { ...current, transferActive: false } : current);
+    setAutoStatus('paused');
+    addLog('Autonomy paused; robot motion and fuel transfer halted.');
+  };
+  const resumeAutonomy = () => {
+    if (autoState !== 'paused') return;
+    pauseRef.current = false;
+    if (missionRef.current.stage === 'transfer' && missionRef.current.valveOpen) commitMission((current) => ({ ...current, transferActive: true }));
+    setAutoStatus('running');
+    addLog('Autonomy resumed from the retained mission state.');
+  };
+  const stopAutonomy = () => {
+    if (autoState !== 'running' && autoState !== 'paused') return;
+    cancelMotion();
+    commitMission((current) => ({ ...current, valveOpen: false, transferActive: false }));
+    setAutoStatus('stopped');
+    addLog('Autonomy stopped. Fuel valve closed; mission progress retained.');
+  };
+  const missionIsComplete = () => missionRef.current.stage === 'complete';
 
   return (
     <main className="app-shell">
@@ -177,7 +437,7 @@ function App() {
             <div className="scene" data-testid="visual-worksite">
               <div className="scene-label scene-tag" style={{ left: 11, top: 11 }} data-testid="value-camera-mode">CAM // {cameraLabel.toUpperCase()} · {zoom.toFixed(1)}×</div>
               <div className="scene-label scene-tag" style={{ right: 11, top: 11 }}>RRM SERVICE MODULE · TARGET A</div>
-              <svg viewBox={viewBox} role="img" aria-label={`Orbital servicing scene in ${cameraLabel} view. Robotic arm end effector at ${pose.endEffector.x.toFixed(0)}, ${pose.endEffector.y.toFixed(0)}; current target at ${target.x}, ${target.y}.`}>
+              <svg ref={svgRef} data-testid="svg-workspace" className={mode === 'autonomous' ? 'workspace-locked' : 'workspace-selectable'} onClick={workspaceClick} viewBox={viewBox} role="img" aria-label={`Orbital servicing scene in ${cameraLabel} view. Click to select a manipulator target. Robotic arm end effector at ${pose.endEffector.x.toFixed(0)}, ${pose.endEffector.y.toFixed(0)}; current target at ${target.x}, ${target.y}.`}>
                 <defs>
                   <linearGradient id="earth" x1="0" x2="1" y1="0" y2="1"><stop stopColor="#237d9a"/><stop offset=".45" stopColor="#17455e"/><stop offset="1" stopColor="#0c2436"/></linearGradient>
                   <linearGradient id="module" x1="0" x2="1"><stop stopColor="#445b63"/><stop offset=".45" stopColor="#91a2a0"/><stop offset="1" stopColor="#435860"/></linearGradient>
@@ -262,6 +522,12 @@ function App() {
                   <circle cx={target.x} cy={target.y} r="3" fill="#72e1df"/>
                   <text x={target.x + 20} y={target.y - 20} fill="#81dfe0" fontSize="8" fontFamily="monospace">TARGET / {mission.stage.toUpperCase()}</text>
                 </g>
+                <g aria-label="Selected move target" pointerEvents="none">
+                  <circle cx={selectedTarget.x} cy={selectedTarget.y} r="10" fill="none" stroke={selectedIk.reachable ? '#f2cb76' : '#e58c75'} strokeWidth="1.5"/>
+                  <path d={`M${selectedTarget.x - 15} ${selectedTarget.y}h30M${selectedTarget.x} ${selectedTarget.y - 15}v30`} stroke={selectedIk.reachable ? '#f2cb76' : '#e58c75'} strokeWidth="1"/>
+                  <circle cx={selectedTarget.x} cy={selectedTarget.y} r="2.5" fill={selectedIk.reachable ? '#f2cb76' : '#e58c75'}/>
+                  <text x={selectedTarget.x + 17} y={selectedTarget.y + 20} fill={selectedIk.reachable ? '#f2cb76' : '#e58c75'} fontSize="8" fontFamily="monospace">SELECTED / IK {selectedIk.reachable ? 'READY' : 'BLOCKED'}</text>
+                </g>
                 <g>
                   <path d={`M${pose.endEffector.x - 9} ${pose.endEffector.y}h18M${pose.endEffector.x} ${pose.endEffector.y - 9}v18`} stroke="#f2cb76" strokeWidth="1"/>
                   <circle cx={pose.endEffector.x} cy={pose.endEffector.y} r="4" fill="none" stroke="#f2cb76"/>
@@ -275,10 +541,12 @@ function App() {
             </div>
             <div className="scene-control">
               <span className="micro-label">Shoulder</span>
-              <div className="slider-wrap"><input aria-label="Shoulder joint angle" data-testid="input-joint-shoulder" type="range" min="-180" max="180" step="1" value={Math.round(angles.shoulderDeg)} onChange={(event) => setAngles((current) => ({ ...current, shoulderDeg: Number(event.target.value) }))}/><span className="micro-label" data-testid="value-shoulder-angle">{angles.shoulderDeg.toFixed(0)}°</span></div>
+              <div className="slider-wrap"><input aria-label="Shoulder joint angle" data-testid="input-joint-shoulder" type="range" min={JOINT_LIMITS.shoulder[0]} max={JOINT_LIMITS.shoulder[1]} step="1" disabled={mode !== 'manual' || motionActive} value={Math.round(angles.shoulderDeg)} onChange={(event) => commitAngles({ ...anglesRef.current, shoulderDeg: Number(event.target.value) })}/><span className="micro-label" data-testid="value-shoulder-angle">{angles.shoulderDeg.toFixed(0)}°</span></div>
               <span className="micro-label">Elbow</span>
-              <div className="slider-wrap"><input aria-label="Elbow joint angle" data-testid="input-joint-elbow" type="range" min="-180" max="180" step="1" value={Math.round(angles.elbowDeg)} onChange={(event) => setAngles((current) => ({ ...current, elbowDeg: Number(event.target.value) }))}/><span className="micro-label" data-testid="value-elbow-angle">{angles.elbowDeg.toFixed(0)}°</span></div>
-               <button className="small-button" data-testid="button-move-to-target" onClick={reposition} aria-label="Move manipulator to current target">Move to target</button>
+              <div className="slider-wrap"><input aria-label="Elbow joint angle" data-testid="input-joint-elbow" type="range" min={JOINT_LIMITS.elbow[0]} max={JOINT_LIMITS.elbow[1]} step="1" disabled={mode !== 'manual' || motionActive} value={Math.round(angles.elbowDeg)} onChange={(event) => commitAngles({ ...anglesRef.current, elbowDeg: Number(event.target.value) })}/><span className="micro-label" data-testid="value-elbow-angle">{angles.elbowDeg.toFixed(0)}°</span></div>
+               {mode === 'manual' && <button className="small-button" data-testid="button-move-to-target" onClick={reposition} disabled={!stageIk.reachable || motionActive} aria-label="Move manipulator to current stage target">Move to target</button>}
+               {mode === 'assisted' && <button className="primary-button assisted-confirm" data-testid="button-assisted-confirm" onClick={confirmAssistedMove} disabled={!selectedIk.reachable || motionActive}>Confirm Move</button>}
+               {mode === 'autonomous' && <span className="auto-control-label">{autoState === 'running' ? 'AUTONOMY ACTIVE' : autoState === 'paused' ? 'AUTONOMY PAUSED' : 'JOINTS LOCKED'}</span>}
             </div>
           </section>
 
@@ -286,6 +554,22 @@ function App() {
             <section className="panel">
               <div className="panel-head"><span>Mission control</span><span className="head-right"><Gauge size={12}/> LIVE</span></div>
               <div className="telemetry">
+                <div className="mode-block">
+                  <div className="control-head"><span className="micro-label">Operating mode</span><span className="micro-label">CONTROL AUTHORITY</span></div>
+                  <div className="mode-row" role="group" aria-label="Operating mode">
+                    <button className={`mode-button ${mode === 'manual' ? 'active' : ''}`} data-testid="button-mode-manual" onClick={() => chooseMode('manual')} aria-pressed={mode === 'manual'}>Manual</button>
+                    <button className={`mode-button ${mode === 'assisted' ? 'active' : ''}`} data-testid="button-mode-assisted" onClick={() => chooseMode('assisted')} aria-pressed={mode === 'assisted'}>Assisted</button>
+                    <button className={`mode-button ${mode === 'autonomous' ? 'active' : ''}`} data-testid="button-mode-autonomous" onClick={() => chooseMode('autonomous')} aria-pressed={mode === 'autonomous'}>Autonomous</button>
+                  </div>
+                  <div className={`auto-status ${mode === 'autonomous' ? 'simulated' : ''}`} data-testid="status-auto-state"><span className="status-dot"/>{mode === 'autonomous' ? `SIMULATED AUTONOMY · ${autoState.toUpperCase()}` : `${mode.toUpperCase()} CONTROL · ${motionActive ? 'MOVE IN PROGRESS' : 'READY'}`}</div>
+                  {mode === 'autonomous' && <div className="autonomy-controls">
+                    {(autoState === 'idle' || autoState === 'stopped' || autoState === 'error') && mission.stage !== 'complete' && <button className="primary-button" data-testid="button-autonomy-start" onClick={runAutonomy}>Start sequence</button>}
+                    {autoState === 'running' && <button className="small-button" data-testid="button-autonomy-pause" onClick={pauseAutonomy}>Pause autonomy</button>}
+                    {autoState === 'paused' && <button className="primary-button" data-testid="button-autonomy-resume" onClick={resumeAutonomy}>Resume autonomy</button>}
+                    {(autoState === 'running' || autoState === 'paused') && <button className="danger-button" data-testid="button-autonomy-stop" onClick={stopAutonomy}>Stop</button>}
+                    {autoState === 'complete' && <span className="auto-complete">SEQUENCE COMPLETE · REPORT READY</span>}
+                  </div>}
+                </div>
                 <div className="stage-name" data-testid="text-current-stage">{currentStageLabel}</div>
                 <div className="stage-hint">{mission.stage === 'inspection' ? 'Survey the module from a focused camera before working near hardware.' : mission.stage === 'wire-clearance' ? 'Bring the mounted combination tool to the retaining wires and blanket edge.' : mission.stage === 'cap-removal' ? 'Remove and secure the protective cap without contacting the exposed port.' : mission.stage === 'valve-access' ? 'Open the valve guard using the Multifunction Tool.' : mission.stage === 'nozzle-connection' ? 'Align and capture the nozzle inside the target tolerance.' : mission.stage === 'transfer' ? mission.transferActive ? 'Illustrative fluid is moving into the receiver. Pause or monitor the fill.' : 'Nozzle secured. Open the valve to begin the simulated transfer.' : mission.stage === 'valve-closure' ? 'Tank target reached. Close the valve before disconnecting.' : mission.stage === 'disconnect' ? 'Disconnect the nozzle only after confirming the valve is closed.' : mission.stage === 'verification' ? 'Use Worksite Close-Up to confirm closed valve and filled tank.' : 'All required servicing operations are complete.'}</div>
                 <div className="telemetry-grid">
@@ -296,6 +580,9 @@ function App() {
                   <div className="metric"><label>Alignment error</label><strong data-testid="value-alignment-error">{alignment.distance.toFixed(1)} px</strong></div>
                   <div className="metric"><label>End effector X / Y</label><strong><span data-testid="value-end-effector-x">{pose.endEffector.x.toFixed(1)}</span> / <span data-testid="value-end-effector-y">{pose.endEffector.y.toFixed(1)}</span></strong></div>
                   <div className="metric"><label>Target X / Y</label><strong><span data-testid="value-target-x">{target.x}</span> / <span data-testid="value-target-y">{target.y}</span></strong></div>
+                  <div className="metric"><label>Selected target X / Y</label><strong><span data-testid="value-selected-target-x">{selectedTarget.x}</span> / <span data-testid="value-selected-target-y">{selectedTarget.y}</span></strong></div>
+                  <div className="metric"><label>IK shoulder / elbow</label><strong>{selectedIk.reachable ? <><span data-testid="value-ik-shoulder">{selectedIk.angles.shoulderDeg.toFixed(1)}°</span> / <span data-testid="value-ik-elbow">{selectedIk.angles.elbowDeg.toFixed(1)}°</span></> : <span className="amber">NO SOLUTION</span>}</strong></div>
+                  <div className="metric"><label>Operating mode</label><strong data-testid="value-operating-mode">{mode.toUpperCase()}</strong></div>
                   <div className="metric"><label>Connection</label><strong className={mission.nozzleConnected ? 'green' : ''}>{mission.nozzleConnected ? 'CONNECTED' : 'OPEN'}</strong></div>
                   <div className="metric"><label>Fuel valve</label><strong className={mission.valveOpen ? 'amber' : 'green'} data-testid="value-valve-status">{mission.valveOpen ? 'OPEN' : 'CLOSED'}</strong></div>
                   <div className="metric"><label>Mission state</label><strong className={mission.stage === 'complete' ? 'green' : ''}>{mission.stage === 'complete' ? 'SUCCESS' : mission.transferActive ? 'TRANSFERRING' : 'IN PROGRESS'}</strong></div>
@@ -303,11 +590,12 @@ function App() {
                 <div className="metric" style={{ marginTop: 7 }}><label>Simulated ethanol analog <span style={{ float: 'right' }}>{mission.transferPercent}%</span></label><div className="transfer-bar"><span style={{ width: `${mission.transferPercent}%` }}/></div><strong data-testid="value-transfer-liters">{liters.toFixed(2)} L / {TANK_CAPACITY_LITERS} L</strong><span className="micro-label" data-testid="value-transfer-rate">Illustrative rate · {SIMULATED_TRANSFER_RATE_LPS.toFixed(1)} L/s</span></div>
                 <div className="micro-label" style={{ marginTop: 6 }}>Simulated volume only — not real telemetry</div>
                 {warning && <div className="warning" role="alert" data-testid="status-warning">{warning}</div>}
+                <div className={`ik-status ${selectedIk.reachable ? 'ok' : 'blocked'}`} role="status" data-testid="status-ik-warning">{selectedIk.reachable ? 'Selected target has a valid IK solution within joint limits.' : selectedIk.reason}</div>
                 {mission.stage === 'complete' && <div className="warning success-note"><strong>Mission report</strong><br/>Verified volume: {liters.toFixed(2)} L of {TANK_CAPACITY_LITERS} L. Valve closed; nozzle disconnected; worksite visually verified. All values are simplified instructional mechanics.</div>}
                 <div className="action-row">
-                  {mission.stage !== 'complete' && mission.stage !== 'transfer' && <button className="primary-button" data-testid="button-primary-action" onClick={operate}>{actionLabel}</button>}
-                  {mission.stage === 'transfer' && !mission.valveOpen && !mission.transferActive && <button className="primary-button" data-testid="button-primary-action" onClick={operate}>{actionLabel}</button>}
-                  {mission.stage === 'transfer' && <button className="small-button" data-testid="button-pause-transfer" onClick={() => { setMission((current) => ({ ...current, transferActive: !current.transferActive })); addLog(mission.transferActive ? 'Transfer paused at current receiver level.' : 'Transfer resumed.'); }}>{mission.transferActive ? 'Pause transfer' : 'Resume transfer'}</button>}
+                  {mode !== 'autonomous' && mission.stage !== 'complete' && mission.stage !== 'transfer' && <button className="primary-button" data-testid="button-primary-action" onClick={operate}>{actionLabel}</button>}
+                  {mode !== 'autonomous' && mission.stage === 'transfer' && !mission.valveOpen && !mission.transferActive && <button className="primary-button" data-testid="button-primary-action" onClick={operate}>{actionLabel}</button>}
+                  {mode !== 'autonomous' && mission.stage === 'transfer' && <button className="small-button" data-testid="button-pause-transfer" onClick={() => { commitMission((current) => ({ ...current, transferActive: !current.transferActive })); addLog(mission.transferActive ? 'Transfer paused at current receiver level.' : 'Transfer resumed.'); }}>{mission.transferActive ? 'Pause transfer' : 'Resume transfer'}</button>}
                   {mission.stage === 'complete' && <button className="primary-button" onClick={reset}>Run again</button>}
                   <button className="danger-button" data-testid="button-reset-mission" onClick={reset} aria-label="Reset all mission state"><RotateCcw size={12}/> Reset</button>
                 </div>
@@ -318,18 +606,18 @@ function App() {
             <section className="panel tool-panel">
               <div className="panel-head" style={{ margin: '0 -11px' }}><span>Tool changer</span><span className="head-right"><Hand size={12}/> ARM 2</span></div>
               <div className="tool-list">
-                {tools.map(({ id, icon: Icon }) => <button key={id} className={`tool-button ${selectedTool === id ? 'active' : ''} ${requiredTool === id ? 'ready' : ''}`} data-testid={toolTestIds[id]} onClick={() => selectTool(id)} aria-pressed={selectedTool === id}>
+                {tools.map(({ id, icon: Icon }) => <button key={id} className={`tool-button ${selectedTool === id ? 'active' : ''} ${requiredTool === id ? 'ready' : ''}`} data-testid={toolTestIds[id]} onClick={() => selectTool(id)} aria-pressed={selectedTool === id} disabled={autoLocked}>
                   <span className="tool-name"><span className="tool-icon"><Icon size={14}/></span>{getToolName(id)}</span><span className="tool-state">{selectedTool === id ? 'MOUNTED' : requiredTool === id ? 'REQUIRED' : 'STOWED'}</span>
                 </button>)}
               </div>
               <div className="micro-label" style={{ marginTop: 7 }}>Selecting a tool changes the end-effector geometry and operation readiness.</div>
               <div className="control-group">
                 <div className="control-head"><span className="micro-label">Camera / tracking view</span><span className="micro-label">{cameraLabel.toUpperCase()}</span></div>
-                <div className="camera-row">{cameraModes.map((mode) => <button key={mode.id} className={`camera-button ${cameraMode === mode.id ? 'active' : ''}`} data-testid={mode.testId} onClick={() => setCamera(mode.id)} aria-pressed={cameraMode === mode.id}>{mode.label}</button>)}</div>
+                <div className="camera-row">{cameraModes.map((mode) => <button key={mode.id} className={`camera-button ${cameraMode === mode.id ? 'active' : ''}`} data-testid={mode.testId} onClick={() => setCamera(mode.id)} aria-pressed={cameraMode === mode.id} disabled={autoLocked}>{mode.label}</button>)}</div>
               </div>
               <div className="control-group">
                 <div className="control-head"><label htmlFor="grip-range" className="micro-label">Safe-grip force</label><span className="micro-label">{gripForce}%{gripWindow ? ` · ${gripWindow[0]}–${gripWindow[1]}%` : ''}</span></div>
-                <input id="grip-range" aria-label="Safe-grip force" data-testid="input-grip-force" type="range" min="0" max="100" value={gripForce} onChange={(event) => updateGrip(Number(event.target.value))}/>
+                <input id="grip-range" aria-label="Safe-grip force" data-testid="input-grip-force" type="range" min="0" max="100" value={gripForce} disabled={mode === 'autonomous'} onChange={(event) => updateGrip(Number(event.target.value))}/>
               </div>
               <div className="control-group">
                 <div className="control-head"><label htmlFor="zoom-range" className="micro-label">Scene magnification</label><span className="micro-label">{zoom.toFixed(1)}×</span></div>
