@@ -111,10 +111,7 @@ Its purpose is to demonstrate core robotics principles and provide an interactiv
 
 ## Live Demonstration
 
-**Interactive Simulator:** [INSERT YOUR PUBLISHED REPLIT URL]
+[Launch the Interactive NASA RRM Simulator](https://robotic-refueling--gillaaronjeet.replit.app)
 
-Explore the robotic manipulator, experiment with its operating modes, and follow the simulated refueling procedure.
-
----
-
+Explore the robotic manipulator, experiment with inverse kinematics, switch between manual, assisted, and autonomous modes, and complete the simulated refueling mission.
 *Created as an independent engineering and technology project exploring robotic satellite servicing and in-space maintenance.*
