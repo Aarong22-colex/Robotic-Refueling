@@ -1,16 +1,22 @@
 # NASA RRM Robotic Refueling Simulator
 
-An interactive engineering simulation inspired by NASA's Robotic Refueling Mission (RRM), exploring robotic satellite servicing, inverse kinematics, and autonomous robotic operations.
+An interactive engineering simulation inspired by NASA's Robotic Refueling Mission (RRM), exploring robotic manipulation, satellite servicing, inverse kinematics, and autonomous operations.
+
+<p align="center">
+  <a href="https://aarong22-colex.github.io/Robotic-Refueling/">
+    <strong>LAUNCH INTERACTIVE SIMULATOR →</strong>
+  </a>
+</p>
 
 ## Project Overview
+
+What if satellites could be repaired and refuelled instead of replaced?
 
 Spacecraft can remain operational even after running out of the propellant needed to perform essential manoeuvres. Robotic servicing offers a potential way to extend spacecraft lifetimes by allowing robots to inspect, maintain, and refuel equipment in orbit.
 
 This project recreates a simplified version of NASA's Robotic Refueling Mission as an interactive browser-based simulator.
 
-The simulation allows users to operate a robotic manipulator, interact with spacecraft servicing hardware, and follow a multi-stage robotic refueling procedure.
-
-The goal is to demonstrate the engineering concepts behind robotic satellite servicing through an interactive environment.
+Users can operate a robotic manipulator, interact with simulated spacecraft servicing hardware, and complete a multi-stage refuelling procedure while exploring the robotics concepts behind the operation.
 
 ## Key Features
 
@@ -22,9 +28,9 @@ The goal is to demonstrate the engineering concepts behind robotic satellite ser
 - Target positioning and alignment.
 
 ### Robotics and Kinematics
-- Forward kinematics to calculate end-effector coordinates from joint angles.
-- Inverse kinematics to calculate joint angles required to reach a target.
-- Reachability checks for target positions.
+- **Forward kinematics:** Calculates end-effector coordinates from joint angles.
+- **Inverse kinematics:** Calculates the joint angles required to reach a target.
+- Target reachability checks.
 - Joint-angle constraints.
 - Smooth interpolation between joint positions.
 
@@ -40,12 +46,11 @@ The goal is to demonstrate the engineering concepts behind robotic satellite ser
 - Users confirm movements before execution.
 
 **Autonomous Mode**
-- Executes the programmed refueling mission sequence.
+- Executes the programmed refuelling mission sequence.
 - Coordinates simulated robotic movements and tool selection.
 - Includes pause, resume, and stop controls.
 
-### Mission Simulation
-The simulator recreates nine stages of a simplified robotic refueling procedure:
+### Nine-Stage Mission Simulation
 
 1. Worksite inspection
 2. Retaining wire removal
@@ -65,7 +70,7 @@ The simulator recreates nine stages of a simplified robotic refueling procedure:
 - Mission progress tracking.
 - Operation logs and status indicators.
 
-## Robotics Concepts
+## Engineering Concepts
 
 ### Forward Kinematics
 
@@ -89,9 +94,9 @@ The simulator uses this calculation in assisted operation, allowing users to sel
 
 - React
 - TypeScript
+- HTML
 - CSS
 - Vite
-- HTML
 
 ## Project Scope and Limitations
 
@@ -111,7 +116,10 @@ Its purpose is to demonstrate core robotics principles and provide an interactiv
 
 ## Live Demonstration
 
-[Launch the Interactive NASA RRM Simulator](https://robotic-refueling--gillaaronjeet.replit.app)
+**[Launch the Interactive NASA RRM Simulator](https://aarong22-colex.github.io/Robotic-Refueling/)**
 
-Explore the robotic manipulator, experiment with inverse kinematics, switch between manual, assisted, and autonomous modes, and complete the simulated refueling mission.
-*Created as an independent engineering and technology project exploring robotic satellite servicing and in-space maintenance.*
+Explore the robotic manipulator, experiment with inverse kinematics, switch between manual, assisted, and autonomous modes, and complete the simulated refuelling mission.
+
+---
+
+*An independent engineering and technology project exploring robotic satellite servicing and in-space maintenance.*
